@@ -1,0 +1,141 @@
+name: Python uv Build
+
+on:
+  workflow_call:
+    inputs:
+      python-version:
+        description: "Python version to install (e.g. 3.12)"
+        required: false
+        type: string
+        default: "3.12"
+      uv-version:
+        description: "uv version to install (e.g. latest, 0.5.x)"
+        required: false
+        type: string
+        default: "latest"
+      working-directory:
+        description: "Directory containing pyproject.toml"
+        required: false
+        type: string
+        default: "."
+      cache-dependency-glob:
+        description: "Glob passed to astral-sh/setup-uv to scope its cache key"
+        required: false
+        type: string
+        default: "**/uv.lock"
+      install-command:
+        description: "Command used to install dependencies"
+        required: false
+        type: string
+        default: "uv sync --all-extras --dev"
+      pre-test-command:
+        description: |
+          Optional command run after install, before tests. Useful for
+          Django 'manage.py makemigrations --check', schema validation,
+          codegen, or other pre-flight checks.
+        required: false
+        type: string
+        default: ""
+      test-command:
+        description: "Command used to run tests"
+        required: false
+        type: string
+        default: "uv run python -m pytest -v"
+      post-test-command:
+        description: |
+          Optional command run after tests. Useful for Django
+          'manage.py check --deploy', repo-specific validators, or chained
+          packaging steps that depend on tests passing.
+        required: false
+        type: string
+        default: ""
+      build-command:
+        description: "Optional command run after post-test-command (e.g. 'uv build')"
+        required: false
+        type: string
+        default: ""
+      upload-artifact-name:
+        description: "If set, upload the path in upload-artifact-path as a workflow artifact under this name."
+        required: false
+        type: string
+        default: ""
+      upload-artifact-path:
+        description: "Path passed to actions/upload-artifact when upload-artifact-name is set."
+        required: false
+        type: string
+        default: ""
+      extra-env:
+        description: |
+          Multi-line string of KEY=VALUE pairs (one per line) appended to
+          $GITHUB_ENV before any user commands run. For non-secret config
+          like CI flags, target environment names, or fake/test-only keys.
+          Real secrets should be passed via the caller's secrets block on
+          a wrapper job rather than via this input.
+        required: false
+        type: string
+        default: ""
+      runs-on:
+        description: "Runner label"
+        required: false
+        type: string
+        default: "ubuntu-latest"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ${{ inputs.runs-on }}
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          version: ${{ inputs.uv-version }}
+          enable-cache: true
+          cache-dependency-glob: ${{ inputs.cache-dependency-glob }}
+
+      - name: Set up Python
+        run: uv python install ${{ inputs.python-version }}
+
+      - name: Export extra env
+        if: ${{ inputs.extra-env != '' }}
+        env:
+          EXTRA_ENV: ${{ inputs.extra-env }}
+        run: |
+          while IFS= read -r line; do
+            [ -z "$line" ] && continue
+            case "$line" in \#*) continue ;; esac
+            printf '%s\n' "$line" >> "$GITHUB_ENV"
+          done <<< "$EXTRA_ENV"
+
+      - name: Install dependencies
+        run: ${{ inputs.install-command }}
+
+      - name: Pre-test command
+        if: ${{ inputs.pre-test-command != '' }}
+        run: ${{ inputs.pre-test-command }}
+
+      - name: Run tests
+        run: ${{ inputs.test-command }}
+
+      - name: Post-test command
+        if: ${{ inputs.post-test-command != '' }}
+        run: ${{ inputs.post-test-command }}
+
+      - name: Build
+        if: ${{ inputs.build-command != '' }}
+        run: ${{ inputs.build-command }}
+
+      - name: Upload artifact
+        if: ${{ inputs.upload-artifact-name != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.upload-artifact-name }}
+          path: ${{ inputs.upload-artifact-path }}
+          if-no-files-found: error
