@@ -1,0 +1,76 @@
+name: Temporal Replay Test
+
+# Reusable workflow that runs a Python uv project's Temporal workflow
+# replay tests. Replay tests use temporalio.worker.Replayer to verify that
+# the current workflow code can replay previously recorded workflow histories
+# without raising NondeterminismError. They are the standard guardrail against
+# breaking changes to deployed Temporal workflows.
+#
+# Repos calling this workflow should:
+#   - Capture representative histories from production into a directory
+#     (default: tests/replay/histories) using e.g.
+#       temporal workflow show --workflow-id <id> --output json > <name>.json
+#   - Have a pytest entrypoint that runs Replayer.replay_workflow against
+#     each captured history (default: 'uv run python -m pytest tests/replay -v').
+
+on:
+  workflow_call:
+    inputs:
+      python-version:
+        description: "Python version to install (e.g. 3.12)"
+        required: false
+        type: string
+        default: "3.12"
+      uv-version:
+        description: "uv version to install (e.g. latest, 0.5.x)"
+        required: false
+        type: string
+        default: "latest"
+      working-directory:
+        description: "Directory containing pyproject.toml"
+        required: false
+        type: string
+        default: "."
+      install-command:
+        description: "Command used to install dependencies"
+        required: false
+        type: string
+        default: "uv sync --all-extras --dev"
+      replay-command:
+        description: "Command used to run replay tests"
+        required: false
+        type: string
+        default: "uv run python -m pytest tests/replay -v"
+      runs-on:
+        description: "Runner label"
+        required: false
+        type: string
+        default: "ubuntu-latest"
+
+permissions:
+  contents: read
+
+jobs:
+  replay:
+    runs-on: ${{ inputs.runs-on }}
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          version: ${{ inputs.uv-version }}
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install ${{ inputs.python-version }}
+
+      - name: Install dependencies
+        run: ${{ inputs.install-command }}
+
+      - name: Run Temporal replay tests
+        run: ${{ inputs.replay-command }}

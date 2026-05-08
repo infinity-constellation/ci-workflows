@@ -1,0 +1,72 @@
+name: Python uv Build
+
+on:
+  workflow_call:
+    inputs:
+      python-version:
+        description: "Python version to install (e.g. 3.12)"
+        required: false
+        type: string
+        default: "3.12"
+      uv-version:
+        description: "uv version to install (e.g. latest, 0.5.x)"
+        required: false
+        type: string
+        default: "latest"
+      working-directory:
+        description: "Directory containing pyproject.toml"
+        required: false
+        type: string
+        default: "."
+      install-command:
+        description: "Command used to install dependencies"
+        required: false
+        type: string
+        default: "uv sync --all-extras --dev"
+      test-command:
+        description: "Command used to run tests"
+        required: false
+        type: string
+        default: "uv run python -m pytest -v"
+      build-command:
+        description: "Optional command run after tests (e.g. 'uv build')"
+        required: false
+        type: string
+        default: ""
+      runs-on:
+        description: "Runner label"
+        required: false
+        type: string
+        default: "ubuntu-latest"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ${{ inputs.runs-on }}
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          version: ${{ inputs.uv-version }}
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install ${{ inputs.python-version }}
+
+      - name: Install dependencies
+        run: ${{ inputs.install-command }}
+
+      - name: Run tests
+        run: ${{ inputs.test-command }}
+
+      - name: Build
+        if: ${{ inputs.build-command != '' }}
+        run: ${{ inputs.build-command }}
