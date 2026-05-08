@@ -1,4 +1,4 @@
-# infinity-fleet
+# ci-workflows
 
 Shared GitHub Actions reusable workflows for the Infinity Constellation GitHub org.
 
