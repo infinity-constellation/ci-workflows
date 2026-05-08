@@ -47,10 +47,3 @@ gh secret set SLACK_WEBHOOK_URL \
   --repo infinity-constellation/<repo> \
   --body "https://hooks.slack.com/services/..."
 ```
-
-## Flux deploy notifications
-
-Flux Notification Controller resources live in
-[`infinity-k8s-fleet`](https://github.com/infinity-constellation/infinity-k8s-fleet)
-under `infrastructure/notifications/`. Those resources watch the `apps-infinity-factory`
-Kustomization and fire Slack alerts on reconcile success and failure.
