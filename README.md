@@ -2,6 +2,31 @@
 
 Shared GitHub Actions reusable workflows for the Infinity Constellation GitHub org.
 
+## Compatibility notes
+
+The Python `uv` workflows below are designed to be the org-wide default for
+any Python project managed with [`uv`](https://docs.astral.sh/uv/). They were
+audited against the existing CI of `infinity-factory-agent`,
+`infinity-factory-api`, `gravity-contracts`, and `gravity-temporal`. To stay
+flexible across these:
+
+- Every command (install, test, build, lint, replay) is overridable via an
+  input.
+- `pre-*` / `post-*` hooks let callers run repo-specific commands (Django
+  `manage.py` checks, `gravity-contracts validate`, etc.) inside the same
+  job without forking the workflow.
+- `extra-env` exposes a multi-line `KEY=VALUE` block for non-secret config
+  (CI flags, target env names, fake/test-only keys). Real secrets stay in
+  caller-side jobs that pass them via `secrets:` to the relevant tool.
+- `working-directory` and `cache-dependency-glob` support monorepos and
+  non-root project layouts.
+- `actions/setup-uv@v4` and `uv python install <version>` mirror the
+  existing pattern in the org (`infinity-factory-agent/ci.yml`).
+
+If a repo's CI step doesn't fit any of these knobs, please open an issue or
+PR on this repo rather than copy-pasting workflow YAML — the goal is one
+canonical Python `uv` lint/build pipeline across the org.
+
 ## Workflows
 
 - [`python-uv-lint.yml`](#python-uv-lintyml--lint-a-python-uv-project) — Lint a Python `uv` project (ruff, optionally black/mypy).
@@ -11,8 +36,11 @@ Shared GitHub Actions reusable workflows for the Infinity Constellation GitHub o
 
 ### `python-uv-lint.yml` — Lint a Python `uv` project
 
-Runs `ruff check` (and optionally `ruff format --check`, `black --check`, and
-`mypy`) against a Python project managed with [`uv`](https://docs.astral.sh/uv/).
+Runs `ruff check` by default and optionally `ruff format --check`,
+`black --check`, `mypy`, and `basedpyright` against a Python project managed
+with [`uv`](https://docs.astral.sh/uv/). Each tool has its own toggle and
+paths input; pre/post hooks let callers run repo-specific commands
+(schema validation, codegen, etc.) inside the same job.
 
 **Usage**
 
@@ -22,6 +50,7 @@ lint:
   with:
     python-version: "3.12"
     black-check: true
+    mypy-check: true
 ```
 
 **Inputs**
@@ -31,7 +60,11 @@ lint:
 | `python-version` | no | `3.12` | Python version to install via `uv python install`. |
 | `uv-version` | no | `latest` | uv version passed to `astral-sh/setup-uv`. |
 | `working-directory` | no | `.` | Directory containing `pyproject.toml`. |
+| `cache-dependency-glob` | no | `**/uv.lock` | Glob passed to `astral-sh/setup-uv` to scope its cache key. |
 | `install-command` | no | `uv sync --all-extras --dev` | Command used to install dependencies. |
+| `pre-lint-command` | no | _(empty)_ | Optional command run after install, before lint checks. |
+| `post-lint-command` | no | _(empty)_ | Optional command run after lint checks. |
+| `extra-env` | no | _(empty)_ | Multi-line `KEY=VALUE` pairs appended to `$GITHUB_ENV` before user commands. Non-secret config only. |
 | `ruff-check` | no | `true` | Run `uv run ruff check`. |
 | `ruff-check-paths` | no | `.` | Paths passed to `ruff check`. |
 | `ruff-format-check` | no | `false` | Run `uv run ruff format --check`. |
@@ -40,14 +73,16 @@ lint:
 | `black-paths` | no | `.` | Paths passed to `black --check`. |
 | `mypy-check` | no | `false` | Run `uv run mypy`. |
 | `mypy-paths` | no | `.` | Paths passed to `mypy`. |
+| `basedpyright-check` | no | `false` | Run `uv run basedpyright`. |
+| `basedpyright-paths` | no | `.` | Paths passed to `basedpyright`. |
 | `runs-on` | no | `ubuntu-latest` | Runner label. |
 
 ### `python-uv-build.yml` — Build and test a Python `uv` project
 
-Installs dependencies, runs tests, and optionally runs a build step (e.g.
-`uv build`).
+Installs dependencies, runs tests, and optionally runs additional steps
+(pre-test setup, post-test deploy checks, packaging, artifact upload).
 
-**Usage**
+**Usage — basic**
 
 ```yaml
 build:
@@ -57,6 +92,30 @@ build:
     test-command: "uv run python -m pytest -v"
 ```
 
+**Usage — Django (with migration check + deploy check)**
+
+```yaml
+build:
+  uses: infinity-constellation/ci-workflows/.github/workflows/python-uv-build.yml@main
+  with:
+    pre-test-command: "uv run python manage.py makemigrations --check --dry-run"
+    post-test-command: "uv run python manage.py check --deploy --fail-level WARNING"
+    extra-env: |
+      SECRET_DJANGO_SECRET_KEY=ci-testing-only-not-a-real-secret
+```
+
+**Usage — package + upload**
+
+```yaml
+build:
+  uses: infinity-constellation/ci-workflows/.github/workflows/python-uv-build.yml@main
+  with:
+    test-command: "uv run gravity-contracts validate && uv run pytest"
+    build-command: "uv run gravity-contracts bundle --output dist/bundle.tar.gz"
+    upload-artifact-name: "contracts-bundle-${{ github.sha }}"
+    upload-artifact-path: "dist/bundle.tar.gz"
+```
+
 **Inputs**
 
 | Input | Required | Default | Description |
@@ -64,9 +123,15 @@ build:
 | `python-version` | no | `3.12` | Python version to install via `uv python install`. |
 | `uv-version` | no | `latest` | uv version passed to `astral-sh/setup-uv`. |
 | `working-directory` | no | `.` | Directory containing `pyproject.toml`. |
+| `cache-dependency-glob` | no | `**/uv.lock` | Glob passed to `astral-sh/setup-uv` to scope its cache key. |
 | `install-command` | no | `uv sync --all-extras --dev` | Command used to install dependencies. |
+| `pre-test-command` | no | _(empty)_ | Optional command run after install, before tests. |
 | `test-command` | no | `uv run python -m pytest -v` | Command used to run tests. |
-| `build-command` | no | _(empty)_ | Optional command run after tests (e.g. `uv build`). |
+| `post-test-command` | no | _(empty)_ | Optional command run after tests. |
+| `build-command` | no | _(empty)_ | Optional command run after `post-test-command` (e.g. `uv build`). |
+| `upload-artifact-name` | no | _(empty)_ | If set, upload `upload-artifact-path` as a workflow artifact. |
+| `upload-artifact-path` | no | _(empty)_ | Path uploaded when `upload-artifact-name` is set. |
+| `extra-env` | no | _(empty)_ | Multi-line `KEY=VALUE` pairs appended to `$GITHUB_ENV` before user commands. Non-secret config only. |
 | `runs-on` | no | `ubuntu-latest` | Runner label. |
 
 ### `temporal-replay-test.yml` — Temporal workflow replay tests
@@ -106,8 +171,12 @@ point at a different test entrypoint.
 | `python-version` | no | `3.12` | Python version to install via `uv python install`. |
 | `uv-version` | no | `latest` | uv version passed to `astral-sh/setup-uv`. |
 | `working-directory` | no | `.` | Directory containing `pyproject.toml`. |
+| `cache-dependency-glob` | no | `**/uv.lock` | Glob passed to `astral-sh/setup-uv` to scope its cache key. |
 | `install-command` | no | `uv sync --all-extras --dev` | Command used to install dependencies. |
+| `pre-replay-command` | no | _(empty)_ | Optional command run after install, before replay tests. |
 | `replay-command` | no | `uv run python -m pytest tests/replay -v` | Command used to run replay tests. |
+| `post-replay-command` | no | _(empty)_ | Optional command run after replay tests. |
+| `extra-env` | no | _(empty)_ | Multi-line `KEY=VALUE` pairs appended to `$GITHUB_ENV` before user commands. Non-secret config only. |
 | `runs-on` | no | `ubuntu-latest` | Runner label. |
 
 ### `notify-release.yml` — Slack release notification

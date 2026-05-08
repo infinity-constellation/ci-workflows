@@ -31,16 +31,41 @@ on:
         required: false
         type: string
         default: "."
+      cache-dependency-glob:
+        description: "Glob passed to astral-sh/setup-uv to scope its cache key"
+        required: false
+        type: string
+        default: "**/uv.lock"
       install-command:
         description: "Command used to install dependencies"
         required: false
         type: string
         default: "uv sync --all-extras --dev"
+      pre-replay-command:
+        description: "Optional command run after install, before replay tests"
+        required: false
+        type: string
+        default: ""
       replay-command:
         description: "Command used to run replay tests"
         required: false
         type: string
         default: "uv run python -m pytest tests/replay -v"
+      post-replay-command:
+        description: "Optional command run after replay tests"
+        required: false
+        type: string
+        default: ""
+      extra-env:
+        description: |
+          Multi-line string of KEY=VALUE pairs (one per line) appended to
+          $GITHUB_ENV before any user commands run. For non-secret config
+          like CI flags, target environment names, or fake/test-only keys.
+          Real secrets should be passed via the caller's secrets block on
+          a wrapper job rather than via this input.
+        required: false
+        type: string
+        default: ""
       runs-on:
         description: "Runner label"
         required: false
@@ -65,12 +90,32 @@ jobs:
         with:
           version: ${{ inputs.uv-version }}
           enable-cache: true
+          cache-dependency-glob: ${{ inputs.cache-dependency-glob }}
 
       - name: Set up Python
         run: uv python install ${{ inputs.python-version }}
 
+      - name: Export extra env
+        if: ${{ inputs.extra-env != '' }}
+        env:
+          EXTRA_ENV: ${{ inputs.extra-env }}
+        run: |
+          while IFS= read -r line; do
+            [ -z "$line" ] && continue
+            case "$line" in \#*) continue ;; esac
+            printf '%s\n' "$line" >> "$GITHUB_ENV"
+          done <<< "$EXTRA_ENV"
+
       - name: Install dependencies
         run: ${{ inputs.install-command }}
 
+      - name: Pre-replay command
+        if: ${{ inputs.pre-replay-command != '' }}
+        run: ${{ inputs.pre-replay-command }}
+
       - name: Run Temporal replay tests
         run: ${{ inputs.replay-command }}
+
+      - name: Post-replay command
+        if: ${{ inputs.post-replay-command != '' }}
+        run: ${{ inputs.post-replay-command }}
