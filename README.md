@@ -15,7 +15,7 @@ published to ECR.
 notify:
   needs: build-and-push
   if: needs.release.outputs.new_release_published == 'true'
-  uses: infinity-constellation/infinity-fleet/.github/workflows/notify-release.yml@main
+  uses: infinity-constellation/ci-workflows/.github/workflows/notify-release.yml@main
   with:
     service: infinity-factory-api
     version: ${{ needs.release.outputs.new_release_version }}
