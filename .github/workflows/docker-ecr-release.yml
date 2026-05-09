@@ -1,0 +1,220 @@
+name: Docker ECR Release
+
+on:
+  workflow_call:
+    inputs:
+      service:
+        description: "Human-readable service name for summaries and notifications"
+        required: true
+        type: string
+      dockerfile:
+        description: "Dockerfile path"
+        required: false
+        type: string
+        default: "Dockerfile.production"
+      context:
+        description: "Docker build context"
+        required: false
+        type: string
+        default: "."
+      ecr-account-id:
+        description: "AWS account ID for ECR login. Defaults to vars.ECR_ACCOUNT_ID, then 979686420760."
+        required: false
+        type: string
+        default: ""
+      ecr-registry:
+        description: "ECR registry host. Defaults to vars.ECR_REGISTRY, then <account>.dkr.ecr.<region>.amazonaws.com."
+        required: false
+        type: string
+        default: ""
+      ecr-repository:
+        description: "ECR repository name. Defaults to vars.ECR_REPOSITORY."
+        required: false
+        type: string
+        default: ""
+      aws-region:
+        description: "AWS region. Defaults to vars.AWS_REGION."
+        required: false
+        type: string
+        default: ""
+      aws-role-to-assume:
+        description: "AWS role to assume. Defaults to vars.AWS_ROLE_TO_ASSUME."
+        required: false
+        type: string
+        default: ""
+      push:
+        description: "Whether to push the image. PR callers should leave this false."
+        required: false
+        type: boolean
+        default: true
+      version:
+        description: "Semver version without v prefix. Required when push=true."
+        required: false
+        type: string
+        default: ""
+      extra-tags:
+        description: "Comma-separated additional tags to append. Optional."
+        required: false
+        type: string
+        default: ""
+      latest-on-main:
+        description: "Tag latest when github.ref_name == main."
+        required: false
+        type: boolean
+        default: false
+      runs-on:
+        description: "Runner label"
+        required: false
+        type: string
+        default: "ubuntu-latest"
+    outputs:
+      image:
+        description: "Image repository URI"
+        value: ${{ jobs.build.outputs.image }}
+      tags:
+        description: "Comma-separated image tags"
+        value: ${{ jobs.build.outputs.tags }}
+      pushed:
+        description: "Whether the workflow pushed an image"
+        value: ${{ jobs.build.outputs.pushed }}
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  build:
+    runs-on: ${{ inputs.runs-on }}
+    outputs:
+      image: ${{ steps.resolve.outputs.image }}
+      tags: ${{ steps.tags.outputs.tags }}
+      pushed: ${{ steps.result.outputs.pushed }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve configuration
+        id: resolve
+        env:
+          INPUT_AWS_REGION: ${{ inputs.aws-region }}
+          INPUT_AWS_ROLE_TO_ASSUME: ${{ inputs.aws-role-to-assume }}
+          INPUT_ECR_ACCOUNT_ID: ${{ inputs.ecr-account-id }}
+          INPUT_ECR_REGISTRY: ${{ inputs.ecr-registry }}
+          INPUT_ECR_REPOSITORY: ${{ inputs.ecr-repository }}
+          VAR_AWS_REGION: ${{ vars.AWS_REGION }}
+          VAR_AWS_ROLE_TO_ASSUME: ${{ vars.AWS_ROLE_TO_ASSUME }}
+          VAR_ECR_ACCOUNT_ID: ${{ vars.ECR_ACCOUNT_ID }}
+          VAR_ECR_REGISTRY: ${{ vars.ECR_REGISTRY }}
+          VAR_ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
+          PUSH: ${{ inputs.push }}
+        run: |
+          set -euo pipefail
+
+          AWS_REGION="${INPUT_AWS_REGION:-${VAR_AWS_REGION:-}}"
+          AWS_ROLE_TO_ASSUME="${INPUT_AWS_ROLE_TO_ASSUME:-${VAR_AWS_ROLE_TO_ASSUME:-}}"
+          ECR_ACCOUNT_ID="${INPUT_ECR_ACCOUNT_ID:-${VAR_ECR_ACCOUNT_ID:-979686420760}}"
+          ECR_REPOSITORY="${INPUT_ECR_REPOSITORY:-${VAR_ECR_REPOSITORY:-}}"
+          ECR_REGISTRY="${INPUT_ECR_REGISTRY:-${VAR_ECR_REGISTRY:-}}"
+
+          if [ -z "$AWS_REGION" ]; then
+            echo "Missing AWS region. Set input aws-region or repo var AWS_REGION." >&2
+            exit 1
+          fi
+          if [ -z "$ECR_REPOSITORY" ]; then
+            echo "Missing ECR repository. Set input ecr-repository or repo var ECR_REPOSITORY." >&2
+            exit 1
+          fi
+          if [ -z "$ECR_REGISTRY" ]; then
+            ECR_REGISTRY="${ECR_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+          fi
+
+          if [ "$PUSH" = "true" ] && [ -z "$AWS_ROLE_TO_ASSUME" ]; then
+            echo "Missing AWS role. Set input aws-role-to-assume or repo var AWS_ROLE_TO_ASSUME." >&2
+            exit 1
+          fi
+
+          echo "aws_region=$AWS_REGION" >> "$GITHUB_OUTPUT"
+          echo "aws_role_to_assume=$AWS_ROLE_TO_ASSUME" >> "$GITHUB_OUTPUT"
+          echo "ecr_account_id=$ECR_ACCOUNT_ID" >> "$GITHUB_OUTPUT"
+          echo "ecr_registry=$ECR_REGISTRY" >> "$GITHUB_OUTPUT"
+          echo "ecr_repository=$ECR_REPOSITORY" >> "$GITHUB_OUTPUT"
+          echo "image=${ECR_REGISTRY}/${ECR_REPOSITORY}" >> "$GITHUB_OUTPUT"
+
+      - name: Validate version when pushing
+        if: ${{ inputs.push }}
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          if [ -z "$VERSION" ]; then
+            echo "Input version is required when push=true." >&2
+            exit 1
+          fi
+
+      - name: Configure AWS (OIDC)
+        if: ${{ inputs.push }}
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ steps.resolve.outputs.aws_role_to_assume }}
+          aws-region: ${{ steps.resolve.outputs.aws_region }}
+
+      - name: Login to Amazon ECR
+        if: ${{ inputs.push }}
+        uses: aws-actions/amazon-ecr-login@v2
+        with:
+          registries: ${{ steps.resolve.outputs.ecr_account_id }}
+
+      - name: Compute image tags
+        id: tags
+        env:
+          IMAGE: ${{ steps.resolve.outputs.image }}
+          VERSION: ${{ inputs.version }}
+          EXTRA_TAGS: ${{ inputs.extra-tags }}
+          LATEST_ON_MAIN: ${{ inputs.latest-on-main }}
+          PUSH: ${{ inputs.push }}
+        run: |
+          set -euo pipefail
+          SHA_TAG="${IMAGE}:sha-${GITHUB_SHA::7}"
+          if [ "$PUSH" = "true" ]; then
+            TAGS="${IMAGE}:v${VERSION},${SHA_TAG}"
+          else
+            TAGS="$SHA_TAG"
+          fi
+
+          if [ "$LATEST_ON_MAIN" = "true" ] && [ "${GITHUB_REF_NAME}" = "main" ]; then
+            TAGS="${TAGS},${IMAGE}:latest"
+          fi
+          if [ -n "$EXTRA_TAGS" ]; then
+            IFS=',' read -ra EXTRA <<< "$EXTRA_TAGS"
+            for tag in "${EXTRA[@]}"; do
+              [ -z "$tag" ] && continue
+              TAGS="${TAGS},${IMAGE}:${tag}"
+            done
+          fi
+
+          echo "tags=$TAGS" >> "$GITHUB_OUTPUT"
+          echo "### Docker Image" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Service**: ${{ inputs.service }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Image**: $IMAGE" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Tags**: $TAGS" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Push**: $PUSH" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.dockerfile }}
+          push: ${{ inputs.push }}
+          tags: ${{ steps.tags.outputs.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          labels: |
+            org.opencontainers.image.version=${{ inputs.version }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+
+      - name: Result
+        id: result
+        run: echo "pushed=${{ inputs.push }}" >> "$GITHUB_OUTPUT"

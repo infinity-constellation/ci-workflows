@@ -32,6 +32,7 @@ canonical Python `uv` lint/build pipeline across the org.
 - [`python-uv-lint.yml`](#python-uv-lintyml--lint-a-python-uv-project) — Lint a Python `uv` project (ruff, optionally black/mypy).
 - [`python-uv-build.yml`](#python-uv-buildyml--build-and-test-a-python-uv-project) — Install dependencies, run tests, and optionally build a Python `uv` project.
 - [`temporal-replay-test.yml`](#temporal-replay-testyml--temporal-workflow-replay-tests) — Run Temporal workflow replay tests for a Python `uv` project.
+- [`docker-ecr-release.yml`](#docker-ecr-releaseyml--build-and-optionally-push-a-docker-image-to-ecr) — Build and optionally push a Docker image to ECR.
 - [`notify-release.yml`](#notify-releaseyml--slack-release-notification) — Slack release notification.
 
 ### `python-uv-lint.yml` — Lint a Python `uv` project
@@ -178,6 +179,70 @@ point at a different test entrypoint.
 | `post-replay-command` | no | _(empty)_ | Optional command run after replay tests. |
 | `extra-env` | no | _(empty)_ | Multi-line `KEY=VALUE` pairs appended to `$GITHUB_ENV` before user commands. Non-secret config only. |
 | `runs-on` | no | `ubuntu-latest` | Runner label. |
+
+### `notify-release.yml` — Slack release notification
+
+### `docker-ecr-release.yml` — Build and optionally push a Docker image to ECR
+
+Builds a Docker image and optionally pushes it to ECR. This workflow is meant
+to be called after semantic-release determines whether a release was published.
+On PRs, call it with `push: false` as a Docker build check. On `staging` and
+`main`, call it with `push: true` and `version` set to the semantic-release
+version.
+
+The workflow resolves AWS/ECR settings from inputs first, then repository
+variables:
+
+- `AWS_REGION`
+- `AWS_ROLE_TO_ASSUME`
+- `ECR_REPOSITORY`
+- `ECR_ACCOUNT_ID` (optional, defaults to `979686420760`)
+- `ECR_REGISTRY` (optional, derived from account/region)
+
+**Usage — PR build check**
+
+```yaml
+docker-build:
+  uses: infinity-constellation/ci-workflows/.github/workflows/docker-ecr-release.yml@main
+  with:
+    service: gravity-temporal
+    dockerfile: Dockerfile.production
+    push: false
+```
+
+**Usage — release push**
+
+```yaml
+docker-release:
+  needs: release
+  if: needs.release.outputs.new_release_published == 'true'
+  uses: infinity-constellation/ci-workflows/.github/workflows/docker-ecr-release.yml@main
+  with:
+    service: gravity-temporal
+    version: ${{ needs.release.outputs.new_release_version }}
+    dockerfile: Dockerfile.production
+    push: true
+  permissions:
+    contents: read
+    id-token: write
+```
+
+**Inputs**
+
+| Input | Required | Default | Description |
+|---|---|---|---|
+| `service` | yes | — | Human-readable service name. |
+| `dockerfile` | no | `Dockerfile.production` | Dockerfile path. |
+| `context` | no | `.` | Build context. |
+| `ecr-account-id` | no | repo var or `979686420760` | ECR account id. |
+| `ecr-registry` | no | derived | ECR registry host. |
+| `ecr-repository` | no | repo var `ECR_REPOSITORY` | ECR repository name. |
+| `aws-region` | no | repo var `AWS_REGION` | AWS region. |
+| `aws-role-to-assume` | no | repo var `AWS_ROLE_TO_ASSUME` | OIDC role ARN. |
+| `push` | no | `true` | Push image to ECR. |
+| `version` | required when `push=true` | — | Semver version without `v`. |
+| `extra-tags` | no | _(empty)_ | Comma-separated extra tags. |
+| `latest-on-main` | no | `false` | Add `latest` on main. |
 
 ### `notify-release.yml` — Slack release notification
 
