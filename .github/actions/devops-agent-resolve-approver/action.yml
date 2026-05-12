@@ -1,0 +1,343 @@
+name: gravity-devops-agent — resolve approver from CODEOWNERS
+
+# Composite action that determines whether a given GitHub login is an eligible
+# approver for the set of paths affected by a pull request, based on the
+# caller repo's CODEOWNERS file. v0 of gravity-devops-agent.
+#
+# Inputs:
+#   approver-login   — GitHub login of the user who submitted the approval
+#   affected-paths   — newline-separated list of paths the PR touches
+#                      (typically stack directories from the discover step)
+#   github-token     — token with read access to repo + read:org for team
+#                      member resolution
+#
+# Outputs:
+#   eligible        — "true" if approver-login owns every path in affected-paths
+#   reason          — human-readable explanation when eligible=false
+#   covering-owners — JSON array of owners required to cover all paths
+#                     (intersection across paths). Useful for the comment
+#                     posted on ineligible-approval events.
+#
+# Semantics — closely mirrors GitHub's CODEOWNERS evaluation:
+#   1. CODEOWNERS file is searched at .github/CODEOWNERS, CODEOWNERS, then
+#      docs/CODEOWNERS (GitHub's documented order).
+#   2. Last matching pattern wins per path (GitHub's rule).
+#   3. Owner can be a user (@login), a team (@org/team-slug), or an email.
+#      v0 supports user and team owners; emails are ignored with a warning.
+#   4. A path with no matching rule is "unowned." v0 fails closed: an
+#      unowned path in a PR makes the approval ineligible regardless of
+#      approver. The DevOps Agent comments asking for explicit ownership.
+#   5. Team membership is resolved via GH API. Requires read:org scope on
+#      the token; fails closed if the API call fails.
+#
+# v1 migration: this action is replaced by a Gravity API call
+# (`POST /v1/access/check`) that resolves owners through OPA against an
+# AccessSnapshot. CODEOWNERS remains the user-facing config; the policy
+# layer behind it changes.
+
+description: "Resolve whether a GitHub login covers every path in a PR per CODEOWNERS rules. v0 of gravity-devops-agent."
+
+inputs:
+  approver-login:
+    description: "GitHub login of the user whose approval is being evaluated."
+    required: true
+  affected-paths:
+    description: "Newline-separated list of paths affected by the PR (typically stack directories)."
+    required: true
+  github-token:
+    description: "GitHub token with repo + read:org. Defaults to GITHUB_TOKEN."
+    required: false
+    default: ${{ github.token }}
+  codeowners-path:
+    description: "Override path to CODEOWNERS. Empty = search .github/CODEOWNERS, CODEOWNERS, docs/CODEOWNERS in that order."
+    required: false
+    default: ""
+
+outputs:
+  eligible:
+    description: "true if approver-login owns every path in affected-paths"
+    value: ${{ steps.resolve.outputs.eligible }}
+  reason:
+    description: "Human-readable explanation when eligible=false"
+    value: ${{ steps.resolve.outputs.reason }}
+  covering-owners:
+    description: "JSON array of owners that together cover every path (used for ineligible-approval comments)"
+    value: ${{ steps.resolve.outputs.covering_owners }}
+  unowned-paths:
+    description: "JSON array of paths with no CODEOWNERS rule"
+    value: ${{ steps.resolve.outputs.unowned_paths }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Resolve CODEOWNERS coverage
+      id: resolve
+      shell: bash
+      env:
+        APPROVER: ${{ inputs.approver-login }}
+        AFFECTED_PATHS: ${{ inputs.affected-paths }}
+        GH_TOKEN: ${{ inputs.github-token }}
+        CODEOWNERS_OVERRIDE: ${{ inputs.codeowners-path }}
+        REPO_OWNER: ${{ github.repository_owner }}
+      run: |
+        set -euo pipefail
+
+        # ---------------------------------------------------------------
+        # Locate CODEOWNERS file
+        # ---------------------------------------------------------------
+        CODEOWNERS_FILE=""
+        if [ -n "$CODEOWNERS_OVERRIDE" ]; then
+          if [ -f "$CODEOWNERS_OVERRIDE" ]; then
+            CODEOWNERS_FILE="$CODEOWNERS_OVERRIDE"
+          else
+            echo "::error::codeowners-path '$CODEOWNERS_OVERRIDE' does not exist"
+            exit 1
+          fi
+        else
+          for candidate in .github/CODEOWNERS CODEOWNERS docs/CODEOWNERS; do
+            if [ -f "$candidate" ]; then
+              CODEOWNERS_FILE="$candidate"
+              break
+            fi
+          done
+        fi
+
+        if [ -z "$CODEOWNERS_FILE" ]; then
+          {
+            echo "eligible=false"
+            echo "reason=No CODEOWNERS file found at .github/CODEOWNERS, CODEOWNERS, or docs/CODEOWNERS."
+            echo "covering_owners=[]"
+            echo "unowned_paths=[]"
+          } >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        echo "Using CODEOWNERS at: $CODEOWNERS_FILE"
+
+        # ---------------------------------------------------------------
+        # Parse CODEOWNERS into pattern => owners[] in order
+        # ---------------------------------------------------------------
+        # Output format on stdout: one rule per line:  <pattern>\t<owner1> <owner2> ...
+        # Skips comments and blank lines. Inline comments (after #) are stripped.
+        parse_codeowners() {
+          local file="$1"
+          # awk handles: blank lines, # comments, inline comments after a token,
+          # multi-owner whitespace separation. Pattern is the first whitespace-
+          # separated token; owners are tokens 2..N until a # token.
+          awk '
+            # Strip inline comments: everything from the first " #" onwards.
+            { sub(/[ \t]+#.*$/, ""); }
+            # Skip blanks and full-line comments.
+            /^[ \t]*$/ { next }
+            /^[ \t]*#/ { next }
+            {
+              pattern = $1
+              owners = ""
+              for (i = 2; i <= NF; i++) {
+                if (owners == "") owners = $i; else owners = owners " " $i
+              }
+              printf "%s\t%s\n", pattern, owners
+            }
+          ' "$file"
+        }
+
+        RULES=$(parse_codeowners "$CODEOWNERS_FILE" || true)
+
+        if [ -z "$RULES" ]; then
+          {
+            echo "eligible=false"
+            echo "reason=CODEOWNERS file at $CODEOWNERS_FILE is empty or has no rules."
+            echo "covering_owners=[]"
+            echo "unowned_paths=[]"
+          } >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        # ---------------------------------------------------------------
+        # CODEOWNERS pattern matching — last match wins
+        # ---------------------------------------------------------------
+        # GitHub patterns are similar to gitignore. Notable differences:
+        #   - leading "/" anchors at repo root.
+        #   - trailing "/" matches directories and contents.
+        #   - "*" matches any sequence of characters except "/" (glob, not
+        #     regex).
+        #   - "**" matches across "/" boundaries.
+        # We approximate via a small awk-based matcher that converts the
+        # CODEOWNERS pattern to an extended regex.
+        codeowners_pattern_to_regex() {
+          # stdin: pattern
+          # stdout: anchored-at-start regex
+          local p="$1"
+          # If pattern starts with "/", anchor at root and strip it.
+          if [[ "$p" == /* ]]; then
+            p="${p#/}"
+            local anchor="^"
+          else
+            local anchor="(^|.*/)"
+          fi
+
+          # Escape regex metacharacters except *, /, ?, (, ), [, ], -.
+          local escaped="${p//./\\.}"
+          escaped="${escaped//+/\\+}"
+          # ** => placeholder, * => [^/]+, ** placeholder => .*
+          escaped="${escaped//\*\*/__DOUBLESTAR__}"
+          escaped="${escaped//\*/[^/]+}"
+          escaped="${escaped//__DOUBLESTAR__/.*}"
+          # ? => single non-/ char
+          escaped="${escaped//\?/[^/]}"
+
+          if [[ "$p" == */ ]]; then
+            # Directory pattern: match the dir or anything under it.
+            printf "%s%s.*\$" "$anchor" "${escaped%/}"
+          else
+            # File or generic pattern: match exactly OR anything under that name as a dir.
+            printf "%s%s(/.*)?\$" "$anchor" "$escaped"
+          fi
+        }
+
+        # owners_for_path PATH RULES_TSV → echoes the matching owners list
+        # (last matching rule's owners), or empty if no match.
+        owners_for_path() {
+          local target="$1"
+          local rules="$2"
+          local matched_owners=""
+          while IFS=$'\t' read -r pat owners; do
+            [ -z "$pat" ] && continue
+            local re
+            re=$(codeowners_pattern_to_regex "$pat")
+            if [[ "$target" =~ $re ]]; then
+              matched_owners="$owners"
+            fi
+          done <<< "$rules"
+          printf "%s" "$matched_owners"
+        }
+
+        # ---------------------------------------------------------------
+        # Per-path owners + intersection
+        # ---------------------------------------------------------------
+        UNOWNED_PATHS=()
+        # Per-path owner sets, newline-separated by path. Each entry is a
+        # space-separated owner list.
+        declare -a OWNER_SETS=()
+
+        while IFS= read -r path; do
+          [ -z "$path" ] && continue
+          OWNERS=$(owners_for_path "$path" "$RULES")
+          if [ -z "$OWNERS" ]; then
+            UNOWNED_PATHS+=("$path")
+            continue
+          fi
+          OWNER_SETS+=("$OWNERS")
+          echo "  $path => $OWNERS"
+        done <<< "$AFFECTED_PATHS"
+
+        # If any path is unowned, fail closed.
+        if [ "${#UNOWNED_PATHS[@]}" -gt 0 ]; then
+          UNOWNED_JSON=$(printf '%s\n' "${UNOWNED_PATHS[@]}" | jq -R -s -c 'split("\n") | map(select(length > 0))')
+          {
+            echo "eligible=false"
+            echo "reason<<EOF"
+            echo "Some affected paths have no CODEOWNERS rule. Add explicit ownership before approval can trigger an apply."
+            echo "EOF"
+            echo "covering_owners=[]"
+            echo "unowned_paths=$UNOWNED_JSON"
+          } >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        if [ "${#OWNER_SETS[@]}" -eq 0 ]; then
+          # No affected paths to evaluate — eligible-by-default is dangerous.
+          # Fail closed.
+          {
+            echo "eligible=false"
+            echo "reason=No affected paths supplied to the resolver."
+            echo "covering_owners=[]"
+            echo "unowned_paths=[]"
+          } >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        # Intersection across all owner sets.
+        INTERSECTION=""
+        for set in "${OWNER_SETS[@]}"; do
+          if [ -z "$INTERSECTION" ]; then
+            INTERSECTION="$set"
+            continue
+          fi
+          NEW_INTERSECTION=""
+          for owner in $INTERSECTION; do
+            if [[ " $set " == *" $owner "* ]]; then
+              if [ -z "$NEW_INTERSECTION" ]; then
+                NEW_INTERSECTION="$owner"
+              else
+                NEW_INTERSECTION="$NEW_INTERSECTION $owner"
+              fi
+            fi
+          done
+          INTERSECTION="$NEW_INTERSECTION"
+        done
+
+        # ---------------------------------------------------------------
+        # Determine if approver covers the intersection
+        # ---------------------------------------------------------------
+        # An approver covers iff:
+        #   - "@<approver>" appears in INTERSECTION, OR
+        #   - "@<org>/<team>" appears in INTERSECTION and the approver is a
+        #     member of that team (resolved via GH API).
+        APPROVER_AT="@$APPROVER"
+        ELIGIBLE=false
+        for owner in $INTERSECTION; do
+          # Case 1: direct user match.
+          if [ "$owner" = "$APPROVER_AT" ]; then
+            ELIGIBLE=true
+            echo "Approver $APPROVER_AT directly listed in intersection."
+            break
+          fi
+          # Case 2: team — owner is "@org/slug".
+          if [[ "$owner" == @*/* ]]; then
+            org="${owner#@}"
+            team_slug="${org#*/}"
+            org="${org%%/*}"
+            # Use GH API to check membership. 200 = member, 404 = not member,
+            # other = error → fail closed.
+            HTTP_CODE=$(curl -sS -o /dev/null -w "%{http_code}" \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "https://api.github.com/orgs/$org/teams/$team_slug/memberships/$APPROVER" || true)
+            case "$HTTP_CODE" in
+              200)
+                ELIGIBLE=true
+                echo "Approver $APPROVER is a member of $owner."
+                break
+                ;;
+              404)
+                echo "Approver $APPROVER is NOT a member of $owner."
+                ;;
+              *)
+                echo "::warning::Team-membership lookup for $owner returned HTTP $HTTP_CODE (token scope may be missing read:org)."
+                ;;
+            esac
+          fi
+          # Case 3: bare email — v0 doesn't support email-based ownership.
+          if [[ "$owner" == *@* && "$owner" != @* ]]; then
+            echo "::warning::Email-based owner $owner is not supported in v0; ignoring."
+          fi
+        done
+
+        # Build the covering-owners JSON for the comment.
+        # shellcheck disable=SC2086 # INTERSECTION is a space-separated list and we want word splitting here.
+        COVERING_JSON=$(printf '%s\n' $INTERSECTION | jq -R -s -c 'split("\n") | map(select(length > 0))')
+
+        {
+          echo "eligible=$ELIGIBLE"
+          if [ "$ELIGIBLE" = "true" ]; then
+            echo "reason=Approver $APPROVER covers all affected paths via CODEOWNERS."
+          else
+            echo "reason<<EOF"
+            echo "Approver @$APPROVER does not own every affected path. Required owners: $INTERSECTION."
+            echo "EOF"
+          fi
+          echo "covering_owners=$COVERING_JSON"
+          echo "unowned_paths=[]"
+        } >> "$GITHUB_OUTPUT"

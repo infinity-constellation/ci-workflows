@@ -1,0 +1,262 @@
+name: gravity-devops-agent — postmortem
+
+# Reusable workflow: dispatched by devops-agent-apply.yml when an apply
+# fails. Dismisses all current PR approvals, adds an `apply-failure` label,
+# and posts a structured postmortem comment with per-stack outcome and
+# suggested next steps from a static playbook.
+#
+# v0 (CI-bound) implementation. v1 maps to
+# DevOpsBridge.handle_apply_failure() in src/gravity_agent/bridges/devops/.
+#
+# v0 explicitly does NOT call an LLM. Postmortem comments are structured:
+# which stacks applied, which failed, error tail, and a static dispatch on
+# known error patterns to suggested next steps. v0.5 may add an optional
+# Bedrock-backed suggester behind a feature flag.
+
+on:
+  workflow_call:
+    inputs:
+      pr-number:
+        description: "Pull request number that failed."
+        required: true
+        type: number
+      apply-run-id:
+        description: "GH Actions run ID of the failed apply (for log retrieval / linking)."
+        required: true
+        type: string
+      applied-stacks:
+        description: "JSON array of stack_ids that applied successfully before the failure."
+        required: false
+        type: string
+        default: "[]"
+      failed-stack:
+        description: "stack_id of the stack that failed."
+        required: true
+        type: string
+      stacks:
+        description: "JSON array of all stacks the PR was attempting to apply (for skipped-list)."
+        required: true
+        type: string
+      approver-login:
+        description: "Login of the approver whose approval triggered the failed apply."
+        required: true
+        type: string
+      runs-on:
+        description: "Runner label."
+        required: false
+        type: string
+        default: "ubuntu-latest"
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  postmortem:
+    runs-on: ${{ inputs.runs-on }}
+    steps:
+      - name: Dismiss all current approvals
+        uses: actions/github-script@v7
+        env:
+          PR_NUMBER: ${{ inputs.pr-number }}
+        with:
+          script: |
+            const issue_number = parseInt(process.env.PR_NUMBER, 10);
+            const { owner, repo } = context.repo;
+
+            // List reviews; dismiss every review currently in APPROVED state.
+            const reviews = await github.paginate(github.rest.pulls.listReviews, {
+              owner, repo, pull_number: issue_number, per_page: 100,
+            });
+            const approved = reviews.filter(r => r.state === 'APPROVED');
+            for (const r of approved) {
+              try {
+                await github.rest.pulls.dismissReview({
+                  owner, repo, pull_number: issue_number,
+                  review_id: r.id,
+                  message: 'gravity-devops-agent: apply failed; please re-review after fixing.',
+                });
+                core.info(`Dismissed approval ${r.id} by @${r.user && r.user.login}`);
+              } catch (err) {
+                core.warning(`Could not dismiss review ${r.id}: ${err.message}`);
+              }
+            }
+
+      - name: Add apply-failure label
+        uses: actions/github-script@v7
+        env:
+          PR_NUMBER: ${{ inputs.pr-number }}
+        with:
+          script: |
+            const issue_number = parseInt(process.env.PR_NUMBER, 10);
+            const { owner, repo } = context.repo;
+            try {
+              await github.rest.issues.addLabels({
+                owner, repo, issue_number, labels: ['apply-failure'],
+              });
+            } catch (err) {
+              // Label may not exist yet; create it then retry.
+              try {
+                await github.rest.issues.createLabel({
+                  owner, repo, name: 'apply-failure',
+                  color: 'b60205',
+                  description: 'gravity-devops-agent: apply failed on this PR',
+                });
+                await github.rest.issues.addLabels({
+                  owner, repo, issue_number, labels: ['apply-failure'],
+                });
+              } catch (e2) {
+                core.warning(`Could not add apply-failure label: ${e2.message}`);
+              }
+            }
+
+      - name: Fetch failed apply log tail
+        id: fetch
+        env:
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ inputs.apply-run-id }}
+          GH_TOKEN: ${{ github.token }}
+          FAILED_STACK: ${{ inputs.failed-stack }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/postmortem"
+          # Download all logs for the failed run; extract the failed-stack
+          # apply step's log tail. gh run view --log dumps the entire run.
+          gh run view "$RUN_ID" --repo "$REPO" --log > "$RUNNER_TEMP/postmortem/full.log" 2>&1 || true
+
+          # The apply step prints "applying: <stack-id>" as a header before
+          # each stack. Extract the section between the failed stack header
+          # and the next header (or EOF).
+          awk -v target="applying: $FAILED_STACK" '
+            $0 ~ target { capture=1 }
+            capture { print }
+            /^=+$/ && capture && NR > 5 { /* keep capturing through closing line */ }
+          ' "$RUNNER_TEMP/postmortem/full.log" \
+            | tail -n 100 \
+            > "$RUNNER_TEMP/postmortem/tail.txt" || true
+
+          # If the awk produced nothing, fall back to last 100 lines of full log.
+          if [ ! -s "$RUNNER_TEMP/postmortem/tail.txt" ]; then
+            tail -n 100 "$RUNNER_TEMP/postmortem/full.log" > "$RUNNER_TEMP/postmortem/tail.txt"
+          fi
+
+          echo "tail_file=$RUNNER_TEMP/postmortem/tail.txt" >> "$GITHUB_OUTPUT"
+
+      - name: Classify error and build suggestions
+        id: classify
+        env:
+          TAIL_FILE: ${{ steps.fetch.outputs.tail_file }}
+        run: |
+          set -euo pipefail
+          TAIL=$(cat "$TAIL_FILE")
+          # Static dispatch on known error signatures. Order matters:
+          # more specific first.
+          CATEGORY="unknown"
+          SUGGESTION=""
+
+          if echo "$TAIL" | grep -qiE 'ConditionalCheckFailedException.*tflock|Error acquiring the state lock|Lock Info'; then
+            CATEGORY="state-lock"
+            SUGGESTION="A DynamoDB state lock is held — usually a previous apply that crashed without releasing. Verify nothing is currently applying this stack, then run \`terragrunt force-unlock <LOCK_ID>\` from a privileged session. The lock ID is shown in the error tail."
+          elif echo "$TAIL" | grep -qiE 'Error.*Throttling|RequestLimitExceeded|TooManyRequestsException'; then
+            CATEGORY="aws-throttle"
+            SUGGESTION="AWS API throttling. Re-run the failed apply via the workflow run page (Re-run failed jobs). If it persists, batch the change into a smaller PR."
+          elif echo "$TAIL" | grep -qiE '403.*Forbidden|AccessDenied|not authorized to perform'; then
+            CATEGORY="iam-denied"
+            SUGGESTION="The apply role lacks permission for an action in this plan. Check the failing IAM action against the role's policy and the explicit Deny statements in InfraPlanAccess / github-action-tf-apply. If a new permission is needed, open a separate PR to grant it; do not retry until the role is updated."
+          elif echo "$TAIL" | grep -qiE 'Conftest|policy violation|denied by policy'; then
+            CATEGORY="opa-deny"
+            SUGGESTION="Conftest/OPA denied this plan. The policy rule should be in the comment thread; address the violation in code or, if it's a false positive, open a separate PR against the policy bundle."
+          elif echo "$TAIL" | grep -qiE 'Error.*ResourceNotFoundException|does not exist|NoSuchEntity'; then
+            CATEGORY="drift"
+            SUGGESTION="A resource Terraform expected to exist is missing — likely state drift. Inspect the resource manually; if it was deleted out-of-band, \`terraform state rm <addr>\` from a break-glass session and re-plan."
+          elif echo "$TAIL" | grep -qiE 'plan is stale|saved plan is stale'; then
+            CATEGORY="stale-plan"
+            SUGGESTION="The saved plan no longer matches state (someone else applied since the plan was generated). Push an empty commit to retrigger the plan; the new plan will be against current state."
+          elif echo "$TAIL" | grep -qiE 'context deadline exceeded|timeout|i/o timeout'; then
+            CATEGORY="timeout"
+            SUGGESTION="Operation timed out (often a long AWS resource creation, e.g. RDS or EKS). Re-run via the workflow page; the resource may have been created in the background and a re-plan will be a no-op or a short tail."
+          else
+            CATEGORY="unknown"
+            SUGGESTION="No matching pattern in the static playbook. Read the error tail below carefully. If this becomes a recurring failure mode, add a classifier branch to devops-agent-postmortem.yml."
+          fi
+
+          {
+            echo "category=$CATEGORY"
+            # Multiline suggestion: emit using delimiter syntax.
+            echo "suggestion<<EOF"
+            echo "$SUGGESTION"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Post structured postmortem comment
+        uses: actions/github-script@v7
+        env:
+          PR_NUMBER: ${{ inputs.pr-number }}
+          FAILED_STACK: ${{ inputs.failed-stack }}
+          APPLIED_JSON: ${{ inputs.applied-stacks }}
+          STACKS_JSON: ${{ inputs.stacks }}
+          APPROVER: ${{ inputs.approver-login }}
+          APPLY_RUN_ID: ${{ inputs.apply-run-id }}
+          REPO: ${{ github.repository }}
+          SERVER_URL: ${{ github.server_url }}
+          CATEGORY: ${{ steps.classify.outputs.category }}
+          SUGGESTION: ${{ steps.classify.outputs.suggestion }}
+          TAIL_FILE: ${{ steps.fetch.outputs.tail_file }}
+        with:
+          script: |
+            const fs = require('fs');
+            const marker = `<!-- devops-agent-postmortem -->`;
+            const failed = process.env.FAILED_STACK;
+            const applied = JSON.parse(process.env.APPLIED_JSON || '[]');
+            const stacks = JSON.parse(process.env.STACKS_JSON || '[]').map(s => s.stack_id);
+            const skipped = stacks.filter(s => !applied.includes(s) && s !== failed);
+
+            const tail = fs.readFileSync(process.env.TAIL_FILE, 'utf8').slice(-12000);
+            const runUrl = `${process.env.SERVER_URL}/${process.env.REPO}/actions/runs/${process.env.APPLY_RUN_ID}`;
+
+            const lines = [
+              marker,
+              `### gravity-devops-agent — Postmortem 🔍`,
+              '',
+              `**Apply failed.** Approvals on this PR have been dismissed; please re-review after the fix.`,
+              '',
+              `| | |`,
+              `|---|---|`,
+              `| Failed stack | \`${failed}\` |`,
+              `| Approver (dismissed) | @${process.env.APPROVER} |`,
+              `| Apply run | [${process.env.APPLY_RUN_ID}](${runUrl}) |`,
+              `| Error category | \`${process.env.CATEGORY}\` |`,
+              '',
+              `**Applied successfully (state may be partially advanced):**`,
+              applied.length > 0 ? applied.map(s => `- ✅ \`${s}\``).join('\n') : '_none_',
+              '',
+              `**Skipped (downstream of failure):**`,
+              skipped.length > 0 ? skipped.map(s => `- ⏭️ \`${s}\``).join('\n') : '_none_',
+              '',
+              `### Suggested next step`,
+              '',
+              process.env.SUGGESTION,
+              '',
+              `<details><summary>Failed apply log tail</summary>`,
+              '',
+              '```',
+              tail,
+              '```',
+              '',
+              `</details>`,
+              '',
+              `_LLM-suggested fixes are intentionally disabled in v0; the suggestion above is from a static playbook keyed on \`${process.env.CATEGORY}\`. To enable LLM suggestions, set the \`enable-llm-suggestions\` input on the caller workflow once that feature ships in v0.5._`,
+            ];
+
+            const body = lines.join('\n');
+            const issue_number = parseInt(process.env.PR_NUMBER, 10);
+            const { owner, repo } = context.repo;
+            const { data: comments } = await github.rest.issues.listComments({
+              owner, repo, issue_number, per_page: 100,
+            });
+            const existing = comments.find(c => c.body && c.body.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number, body });
+            }

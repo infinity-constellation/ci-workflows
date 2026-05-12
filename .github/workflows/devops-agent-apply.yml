@@ -1,0 +1,573 @@
+name: gravity-devops-agent — apply
+
+# Reusable workflow: applies the saved plans for a set of stacks in
+# Terragrunt-dependency-graph topological order. On success, enables
+# auto-squash-merge on the PR with a structured trailer block. On failure,
+# dispatches the postmortem workflow.
+#
+# v0 (CI-bound) implementation. v1 maps to DevOpsBridge.run_apply_task() in
+# src/gravity_agent/bridges/devops/.
+#
+# Trigger: workflow_dispatch (called by devops-agent-approve.yml after a
+# CODEOWNERS-eligible review approval). Pre-merge: applies against the PR
+# head SHA, NOT against main, so the applied diff is exactly what was
+# reviewed.
+#
+# Why one job, not a matrix:
+#   Matrix legs are independent runners that don't share working directories
+#   and can race on shared state (DynamoDB locks). Multi-stack apply must
+#   honor Terragrunt's `dependency {}` graph to be correct. Therefore one
+#   job that walks `terragrunt graph-dependencies`, applies each stack's
+#   saved plan in topo order, and emits per-stack lifecycle events.
+
+on:
+  workflow_call:
+    inputs:
+      pr-number:
+        description: "Pull request number to operate on. Required."
+        required: true
+        type: number
+      head-sha:
+        description: "SHA of the PR head this apply was authorized against. Required (so we refuse if the PR has new commits)."
+        required: true
+        type: string
+      stacks:
+        description: "JSON array of {directory, stack_id, plan_artifact, plan_run_id, engine, destroy} objects, one per stack to apply."
+        required: true
+        type: string
+      approver-login:
+        description: "Login of the user whose approval triggered this apply (for audit trail)."
+        required: true
+        type: string
+      terraform-version:
+        description: "Terraform version. Should match the plan workflow."
+        required: false
+        type: string
+        default: "1.15.2"
+      terragrunt-version:
+        description: "Terragrunt version. Should match the plan workflow."
+        required: false
+        type: string
+        default: "0.99.5"
+      aws-role-to-assume:
+        description: "ARN of the AWS role to assume via OIDC. Defaults to vars.AWS_TF_APPLY_ROLE_TO_ASSUME, then vars.AWS_TF_ROLE_TO_ASSUME."
+        required: false
+        type: string
+        default: ""
+      aws-region:
+        description: "AWS region. Defaults to vars.AWS_REGION, then us-east-2."
+        required: false
+        type: string
+        default: ""
+      destroy-confirmed:
+        description: "Must be true if any stack has destroy=true."
+        required: false
+        type: boolean
+        default: false
+      auto-merge:
+        description: "When true (default), enables auto-squash-merge on the PR after a successful apply."
+        required: false
+        type: boolean
+        default: true
+      runs-on:
+        description: "Runner label."
+        required: false
+        type: string
+        default: "ubuntu-latest"
+
+permissions:
+  contents: write           # apply produces commits/tags via auto-merge
+  id-token: write           # OIDC
+  pull-requests: write      # comment + auto-merge
+  actions: read             # fetch artifacts from prior runs
+
+# Per-PR concurrency: only one apply at a time per PR. New approvals while
+# an apply is running queue behind the current one.
+concurrency:
+  group: devops-agent-apply-${{ github.repository }}-pr-${{ inputs.pr-number }}
+  cancel-in-progress: false
+
+jobs:
+  apply:
+    runs-on: ${{ inputs.runs-on }}
+    outputs:
+      outcome: ${{ steps.summarize.outputs.outcome }}
+      applied-stacks: ${{ steps.summarize.outputs.applied_stacks }}
+      failed-stack: ${{ steps.summarize.outputs.failed_stack }}
+    steps:
+      - name: Resolve configuration
+        id: resolve
+        env:
+          INPUT_AWS_REGION: ${{ inputs.aws-region }}
+          INPUT_AWS_ROLE_TO_ASSUME: ${{ inputs.aws-role-to-assume }}
+          VAR_AWS_REGION: ${{ vars.AWS_REGION }}
+          VAR_AWS_TF_APPLY_ROLE: ${{ vars.AWS_TF_APPLY_ROLE_TO_ASSUME }}
+          VAR_AWS_TF_ROLE: ${{ vars.AWS_TF_ROLE_TO_ASSUME }}
+          STACKS_JSON: ${{ inputs.stacks }}
+          DESTROY_CONFIRMED: ${{ inputs.destroy-confirmed }}
+        run: |
+          set -euo pipefail
+
+          AWS_REGION="${INPUT_AWS_REGION:-${VAR_AWS_REGION:-us-east-2}}"
+          AWS_ROLE_TO_ASSUME="${INPUT_AWS_ROLE_TO_ASSUME:-${VAR_AWS_TF_APPLY_ROLE:-${VAR_AWS_TF_ROLE:-}}}"
+
+          if [ -z "$AWS_ROLE_TO_ASSUME" ]; then
+            echo "::error::Missing AWS role. Set input aws-role-to-assume or vars AWS_TF_APPLY_ROLE_TO_ASSUME / AWS_TF_ROLE_TO_ASSUME."
+            exit 1
+          fi
+
+          # Validate stacks JSON.
+          if ! echo "$STACKS_JSON" | jq -e 'type == "array" and length > 0' > /dev/null; then
+            echo "::error::stacks input must be a non-empty JSON array."
+            exit 1
+          fi
+
+          # If any stack is destroy=true, destroy-confirmed must be true.
+          ANY_DESTROY=$(echo "$STACKS_JSON" | jq -r 'any(.destroy == true)')
+          if [ "$ANY_DESTROY" = "true" ] && [ "$DESTROY_CONFIRMED" != "true" ]; then
+            echo "::error::At least one stack has destroy=true but destroy-confirmed=false. Refusing."
+            exit 1
+          fi
+
+          {
+            echo "aws_region=$AWS_REGION"
+            echo "aws_role_to_assume=$AWS_ROLE_TO_ASSUME"
+            echo "stack_count=$(echo "$STACKS_JSON" | jq 'length')"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Checkout PR head
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.head-sha }}
+          fetch-depth: 1
+
+      - name: Verify head SHA matches PR head
+        env:
+          PR_NUMBER: ${{ inputs.pr-number }}
+          EXPECTED_SHA: ${{ inputs.head-sha }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          ACTUAL_SHA=$(gh pr view "$PR_NUMBER" --json headRefOid --jq .headRefOid \
+            --repo "$GITHUB_REPOSITORY")
+          if [ "$ACTUAL_SHA" != "$EXPECTED_SHA" ]; then
+            echo "::error::PR #$PR_NUMBER head is now $ACTUAL_SHA but apply was authorized against $EXPECTED_SHA. New commits invalidate prior approvals; refusing."
+            exit 1
+          fi
+          echo "Confirmed apply against authorized head $EXPECTED_SHA"
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ inputs.terraform-version }}
+          terraform_wrapper: false
+
+      - name: Set up Terragrunt
+        env:
+          TG_VERSION: ${{ inputs.terragrunt-version }}
+          STACKS_JSON: ${{ inputs.stacks }}
+        run: |
+          set -euo pipefail
+          # Install Terragrunt if any stack uses it.
+          NEEDS_TG=$(echo "$STACKS_JSON" | jq -r 'any(.engine == "terragrunt")')
+          if [ "$NEEDS_TG" = "true" ]; then
+            curl -fsSL "https://github.com/gruntwork-io/terragrunt/releases/download/v${TG_VERSION}/terragrunt_linux_amd64" \
+              -o /usr/local/bin/terragrunt
+            chmod +x /usr/local/bin/terragrunt
+            terragrunt --version
+          fi
+
+      - name: Configure AWS (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ steps.resolve.outputs.aws_role_to_assume }}
+          aws-region: ${{ steps.resolve.outputs.aws_region }}
+          role-session-name: devops-agent-apply-pr${{ inputs.pr-number }}-${{ github.run_id }}
+
+      - name: Download saved plans
+        env:
+          STACKS_JSON: ${{ inputs.stacks }}
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/plans"
+
+          # Each stack: download its plan-artifact from the recorded run.
+          echo "$STACKS_JSON" | jq -c '.[]' | while read -r stack; do
+            STACK_ID=$(echo "$stack" | jq -r '.stack_id')
+            ARTIFACT=$(echo "$stack" | jq -r '.plan_artifact')
+            RUN_ID=$(echo "$stack" | jq -r '.plan_run_id')
+            DEST="$RUNNER_TEMP/plans/$STACK_ID"
+            mkdir -p "$DEST"
+            echo "Downloading $ARTIFACT from run $RUN_ID into $DEST"
+            gh run download "$RUN_ID" --repo "$REPO" --name "$ARTIFACT" --dir "$DEST"
+            # Sanity check.
+            for f in plan.bin plan.json plan.txt metadata.json; do
+              if [ ! -f "$DEST/$f" ]; then
+                echo "::error::Artifact $ARTIFACT missing $f"
+                exit 1
+              fi
+            done
+            # Engine check: metadata must match the input.
+            META_ENGINE=$(jq -r .engine "$DEST/metadata.json")
+            INPUT_ENGINE=$(echo "$stack" | jq -r '.engine')
+            if [ "$META_ENGINE" != "$INPUT_ENGINE" ]; then
+              echo "::error::Engine mismatch for $STACK_ID: artifact says $META_ENGINE, input says $INPUT_ENGINE"
+              exit 1
+            fi
+          done
+
+      - name: Compute apply order (Terragrunt graph-dependencies)
+        id: order
+        env:
+          STACKS_JSON: ${{ inputs.stacks }}
+        run: |
+          set -euo pipefail
+
+          # For each Terragrunt stack, run `terragrunt graph-dependencies`
+          # from its directory to capture which directories it depends on.
+          # Then topologically sort the union of those edges restricted to
+          # stacks present in our input set.
+          #
+          # For raw Terraform stacks (no Terragrunt deps), order them after
+          # Terragrunt deps in input order — typical case is one or the
+          # other, not mixed; if mixed, raw TF stacks are independent.
+
+          mkdir -p "$RUNNER_TEMP/graph"
+          INPUT_DIRS=$(echo "$STACKS_JSON" | jq -r '.[].directory')
+
+          # Build a dependency edge list: "child<TAB>parent" where child
+          # depends on parent.
+          : > "$RUNNER_TEMP/graph/edges.txt"
+          for dir in $INPUT_DIRS; do
+            ENGINE=$(echo "$STACKS_JSON" | jq -r --arg d "$dir" '.[] | select(.directory == $d) | .engine')
+            if [ "$ENGINE" = "terragrunt" ]; then
+              # `terragrunt graph-dependencies` output format:
+              #   digraph {
+              #     "/abs/path/child" ;
+              #     "/abs/path/child" -> "/abs/path/parent" ;
+              #   }
+              GRAPH=$(cd "$dir" && terragrunt graph-dependencies --non-interactive 2>/dev/null || true)
+              echo "$GRAPH" \
+                | grep -E '"\s*->\s*"' \
+                | sed -E 's/^\s*"([^"]+)"\s*->\s*"([^"]+)"\s*;\s*$/\1\t\2/' \
+                >> "$RUNNER_TEMP/graph/edges.txt" || true
+            fi
+          done
+
+          # Convert absolute paths in edges to repo-relative input dirs (only
+          # keep edges where both endpoints are in our input set).
+          REPO_ROOT=$(pwd)
+          python3 - "$RUNNER_TEMP/graph/edges.txt" "$REPO_ROOT" <<'PY' > "$RUNNER_TEMP/graph/order.txt"
+          import json
+          import os
+          import sys
+          from collections import defaultdict, deque
+
+          edges_file = sys.argv[1]
+          repo_root = os.path.abspath(sys.argv[2])
+          stacks = json.loads(os.environ["STACKS_JSON"])
+          input_dirs = [s["directory"] for s in stacks]
+          input_set = set(input_dirs)
+
+          def to_rel(p: str) -> str:
+              ap = os.path.abspath(p)
+              if ap.startswith(repo_root + os.sep):
+                  return os.path.relpath(ap, repo_root)
+              return p  # fallback; will not match input_set
+
+          # Edges: child depends on parent → parent must apply first.
+          deps = defaultdict(set)  # node -> set(parents in input_set)
+          all_nodes = set(input_dirs)
+          with open(edges_file) as f:
+              for line in f:
+                  parts = line.strip().split("\t")
+                  if len(parts) != 2:
+                      continue
+                  child, parent = to_rel(parts[0]), to_rel(parts[1])
+                  if child in input_set and parent in input_set:
+                      deps[child].add(parent)
+                      all_nodes.add(child)
+                      all_nodes.add(parent)
+
+          # Kahn's algorithm; ties broken by input order.
+          input_order = {d: i for i, d in enumerate(input_dirs)}
+          indegree = {n: len(deps[n]) for n in all_nodes}
+          ready = sorted([n for n, d in indegree.items() if d == 0],
+                         key=lambda n: input_order.get(n, 1_000_000))
+          ordered = []
+          # Reverse adjacency.
+          rev = defaultdict(set)
+          for child, parents in deps.items():
+              for p in parents:
+                  rev[p].add(child)
+
+          while ready:
+              n = ready.pop(0)
+              ordered.append(n)
+              for child in sorted(rev[n], key=lambda c: input_order.get(c, 1_000_000)):
+                  indegree[child] -= 1
+                  if indegree[child] == 0:
+                      ready.append(child)
+              ready.sort(key=lambda c: input_order.get(c, 1_000_000))
+
+          if len(ordered) != len(all_nodes):
+              # Cycle detected — fall back to input order with a warning.
+              print("::warning::Dependency cycle detected; falling back to input order.", file=sys.stderr)
+              for d in input_dirs:
+                  if d not in ordered:
+                      ordered.append(d)
+
+          for d in ordered:
+              print(d)
+          PY
+
+          echo "Apply order:"
+          cat "$RUNNER_TEMP/graph/order.txt"
+          {
+            echo "order_file=$RUNNER_TEMP/graph/order.txt"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Apply in topological order
+        id: apply
+        env:
+          STACKS_JSON: ${{ inputs.stacks }}
+          ORDER_FILE: ${{ steps.order.outputs.order_file }}
+          PR_NUMBER: ${{ inputs.pr-number }}
+          APPROVER_LOGIN: ${{ inputs.approver-login }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p "$RUNNER_TEMP/apply-logs"
+          APPLIED=()
+          FAILED_STACK=""
+          FAILED_LOG=""
+
+          while IFS= read -r DIR; do
+            [ -z "$DIR" ] && continue
+            STACK=$(echo "$STACKS_JSON" | jq -c --arg d "$DIR" '.[] | select(.directory == $d)')
+            STACK_ID=$(echo "$STACK" | jq -r '.stack_id')
+            ENGINE=$(echo "$STACK" | jq -r '.engine')
+            DESTROY=$(echo "$STACK" | jq -r '.destroy')
+            PLAN_DIR="$RUNNER_TEMP/plans/$STACK_ID"
+            LOG="$RUNNER_TEMP/apply-logs/$STACK_ID.log"
+
+            echo ""
+            echo "============================================================"
+            echo " applying: $STACK_ID  ($DIR, engine=$ENGINE, destroy=$DESTROY)"
+            echo "============================================================"
+
+            # Init in the working directory (state backend may need to
+            # initialize fresh on this runner).
+            (
+              cd "$DIR"
+              if [ "$ENGINE" = "terragrunt" ]; then
+                terragrunt init --non-interactive -reconfigure
+              else
+                terraform init -reconfigure -input=false
+              fi
+            )
+
+            # Apply the saved plan. Fail fast on error and capture log.
+            set +e
+            (
+              cd "$DIR"
+              if [ "$ENGINE" = "terragrunt" ]; then
+                terragrunt apply --non-interactive -input=false -no-color "$PLAN_DIR/plan.bin"
+              else
+                terraform apply -input=false -no-color "$PLAN_DIR/plan.bin"
+              fi
+            ) 2>&1 | tee "$LOG"
+            APPLY_EXIT=${PIPESTATUS[0]}
+            set -e
+
+            if [ "$APPLY_EXIT" -ne 0 ]; then
+              FAILED_STACK="$STACK_ID"
+              FAILED_LOG="$LOG"
+              echo "::error::apply failed for $STACK_ID (exit=$APPLY_EXIT)"
+              break
+            fi
+            APPLIED+=("$STACK_ID")
+          done < "$ORDER_FILE"
+
+          {
+            echo "applied=$(printf '%s\n' "${APPLIED[@]}" | jq -R -s -c 'split("\n") | map(select(length > 0))')"
+            echo "failed_stack=$FAILED_STACK"
+            echo "failed_log=$FAILED_LOG"
+          } >> "$GITHUB_OUTPUT"
+
+          if [ -n "$FAILED_STACK" ]; then
+            exit 1
+          fi
+
+      - name: Summarize apply
+        id: summarize
+        if: ${{ always() }}
+        env:
+          STACKS_JSON: ${{ inputs.stacks }}
+          APPLIED_JSON: ${{ steps.apply.outputs.applied }}
+          FAILED_STACK: ${{ steps.apply.outputs.failed_stack }}
+          PR_NUMBER: ${{ inputs.pr-number }}
+          APPROVER_LOGIN: ${{ inputs.approver-login }}
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          set -euo pipefail
+
+          OUTCOME="success"
+          if [ "$JOB_STATUS" != "success" ] || [ -n "$FAILED_STACK" ]; then
+            OUTCOME="failure"
+          fi
+
+          {
+            echo "outcome=$OUTCOME"
+            echo "applied_stacks=$APPLIED_JSON"
+            echo "failed_stack=$FAILED_STACK"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "## DevOps Agent — Apply outcome: $OUTCOME"
+            echo ""
+            echo "**PR**: #$PR_NUMBER  **Approver**: @$APPROVER_LOGIN"
+            echo ""
+            echo "**Stacks applied** (in order):"
+            echo "$APPLIED_JSON" | jq -r '.[] | "- ✅ \(.)"'
+            if [ -n "$FAILED_STACK" ]; then
+              echo ""
+              echo "**Failed stack**: \`$FAILED_STACK\`"
+              REMAINING=$(echo "$STACKS_JSON" | jq -r --argjson applied "$APPLIED_JSON" --arg failed "$FAILED_STACK" '
+                .[] | select((.stack_id as $s | $applied | index($s) | not) and (.stack_id != $failed)) | .stack_id')
+              if [ -n "$REMAINING" ]; then
+                echo ""
+                echo "**Skipped (downstream of failure)**:"
+                while IFS= read -r line; do
+                  [ -z "$line" ] && continue
+                  echo "- ⏭️ $line"
+                done <<< "$REMAINING"
+              fi
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Comment apply outcome on PR
+        if: ${{ always() }}
+        uses: actions/github-script@v7
+        env:
+          OUTCOME: ${{ steps.summarize.outputs.outcome }}
+          APPLIED_JSON: ${{ steps.summarize.outputs.applied_stacks }}
+          FAILED_STACK: ${{ steps.summarize.outputs.failed_stack }}
+          STACKS_JSON: ${{ inputs.stacks }}
+          PR_NUMBER: ${{ inputs.pr-number }}
+          APPROVER_LOGIN: ${{ inputs.approver-login }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        with:
+          script: |
+            const marker = `<!-- devops-agent-apply -->`;
+            const applied = JSON.parse(process.env.APPLIED_JSON || '[]');
+            const stacks = JSON.parse(process.env.STACKS_JSON || '[]');
+            const failed = process.env.FAILED_STACK;
+            const outcome = process.env.OUTCOME;
+
+            const appliedList = applied.map(s => `- ✅ \`${s}\``).join('\n') || '_none_';
+            const skipped = stacks
+              .map(s => s.stack_id)
+              .filter(id => !applied.includes(id) && id !== failed);
+            const skippedList = skipped.length > 0 ? skipped.map(s => `- ⏭️ \`${s}\``).join('\n') : '';
+
+            const lines = [
+              marker,
+              outcome === 'success'
+                ? `### gravity-devops-agent — Apply succeeded ✅`
+                : `### gravity-devops-agent — Apply FAILED ❌`,
+              '',
+              `Approver: @${process.env.APPROVER_LOGIN}  ·  [workflow run](${process.env.RUN_URL})`,
+              '',
+              `**Applied:**`,
+              appliedList,
+            ];
+            if (failed) {
+              lines.push('', `**Failed stack:** \`${failed}\``);
+            }
+            if (skippedList) {
+              lines.push('', `**Skipped (downstream of failure):**`, skippedList);
+            }
+            if (outcome === 'success') {
+              lines.push('', `Auto-merge will engage once branch protection requirements are satisfied.`);
+            } else {
+              lines.push('', `Approvals will be dismissed and a postmortem comment posted shortly.`);
+            }
+
+            const body = lines.join('\n');
+            const { owner, repo } = context.repo;
+            const issue_number = parseInt(process.env.PR_NUMBER, 10);
+
+            const { data: comments } = await github.rest.issues.listComments({
+              owner, repo, issue_number, per_page: 100,
+            });
+            const existing = comments.find(c =>
+              c.user && c.user.type === 'Bot' && c.body && c.body.includes(marker)
+            );
+            if (existing) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number, body });
+            }
+
+      - name: Enable auto-squash-merge on success
+        if: ${{ inputs.auto-merge && steps.summarize.outputs.outcome == 'success' }}
+        env:
+          PR_NUMBER: ${{ inputs.pr-number }}
+          REPO: ${{ github.repository }}
+          APPLIED_JSON: ${{ steps.summarize.outputs.applied_stacks }}
+          APPROVER_LOGIN: ${{ inputs.approver-login }}
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          # Build a structured trailer block recorded in the squash commit.
+          APPLIED_LINES=$(echo "$APPLIED_JSON" | jq -r '.[]')
+          APPLIED_LIST="${APPLIED_LINES//$'\n'/$'\n'  - }"
+          APPLIED_LIST="  - ${APPLIED_LIST}"
+          BODY=$(cat <<EOF
+          DevOps-Agent-Apply: success
+          DevOps-Agent-Approver: @$APPROVER_LOGIN
+          DevOps-Agent-Run: $RUN_URL
+          DevOps-Agent-Applied:
+          $APPLIED_LIST
+          EOF
+          )
+          # `gh pr merge --auto` enables auto-merge; GitHub completes the
+          # merge once required checks/reviews pass. We pass the body as the
+          # squash commit message body.
+          gh pr merge "$PR_NUMBER" \
+            --repo "$REPO" \
+            --auto \
+            --squash \
+            --body "$BODY"
+
+      - name: Dispatch postmortem on failure
+        if: ${{ steps.summarize.outputs.outcome == 'failure' }}
+        env:
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ inputs.pr-number }}
+          STACKS_JSON: ${{ inputs.stacks }}
+          APPLIED_JSON: ${{ steps.summarize.outputs.applied_stacks }}
+          FAILED_STACK: ${{ steps.summarize.outputs.failed_stack }}
+          APPROVER_LOGIN: ${{ inputs.approver-login }}
+          APPLY_RUN_ID: ${{ github.run_id }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # The postmortem workflow path is conventional; callers that
+          # rename it must override this dispatch in their own caller.
+          POSTMORTEM_REF=".github/workflows/devops-agent-postmortem.yml"
+
+          gh workflow run "$POSTMORTEM_REF" \
+            --repo "$REPO" \
+            --ref "$GITHUB_REF_NAME" \
+            -f "pr_number=$PR_NUMBER" \
+            -f "apply_run_id=$APPLY_RUN_ID" \
+            -f "applied_stacks=$APPLIED_JSON" \
+            -f "failed_stack=$FAILED_STACK" \
+            -f "stacks=$STACKS_JSON" \
+            -f "approver_login=$APPROVER_LOGIN"
+          echo "Dispatched postmortem workflow for PR #$PR_NUMBER (failed=$FAILED_STACK)"

@@ -1,0 +1,231 @@
+name: gravity-devops-agent — approve
+
+# Reusable workflow: triggered by `pull_request_review` from a caller. When
+# a review is submitted with state=approved, resolves whether the approver
+# covers every affected path per CODEOWNERS, then (if eligible) dispatches
+# the apply workflow with the saved plan artifacts from the most recent
+# successful plan run.
+#
+# v0 (CI-bound) implementation. v1 maps to DevOpsBridge.handle_review_event()
+# in src/gravity_agent/bridges/devops/.
+#
+# Why a separate workflow rather than inline in the caller:
+#   - Reusable across portcos with the same approver-eligibility logic.
+#   - Apply dispatch needs a workflow_dispatch endpoint; this workflow is
+#     the one that calls devops-agent-apply.yml on behalf of the caller.
+#   - Lifecycle event vocabulary (lifecycle.queued, infra.approval.granted,
+#     etc.) lives here rather than scattered across portco infra.yml's.
+
+on:
+  workflow_call:
+    inputs:
+      apply-workflow-ref:
+        description: "Workflow file path of the apply workflow to dispatch (e.g. '.github/workflows/devops-agent-apply.yml'). Required."
+        required: true
+        type: string
+      stacks:
+        description: "JSON array of {directory, stack_id, plan_artifact, plan_run_id, engine, destroy} objects, one per stack to apply. Required."
+        required: true
+        type: string
+      affected-paths:
+        description: "Newline-separated list of repo-relative paths the PR touches. Required for CODEOWNERS resolution."
+        required: true
+        type: string
+      codeowners-path:
+        description: "Override path to CODEOWNERS. Empty = auto-detect."
+        required: false
+        type: string
+        default: ""
+      auto-merge:
+        description: "Forwarded to apply workflow."
+        required: false
+        type: boolean
+        default: true
+      destroy-confirmed:
+        description: "Required when any stack has destroy=true."
+        required: false
+        type: boolean
+        default: false
+      runs-on:
+        description: "Runner label."
+        required: false
+        type: string
+        default: "ubuntu-latest"
+    outputs:
+      eligible:
+        description: "true if the approver covers all affected paths."
+        value: ${{ jobs.evaluate.outputs.eligible }}
+      apply-dispatched:
+        description: "true if the apply workflow was dispatched."
+        value: ${{ jobs.evaluate.outputs.apply_dispatched }}
+
+permissions:
+  contents: read
+  pull-requests: write
+  actions: write    # needed to dispatch the apply workflow
+
+jobs:
+  evaluate:
+    runs-on: ${{ inputs.runs-on }}
+    outputs:
+      eligible: ${{ steps.resolve.outputs.eligible }}
+      apply_dispatched: ${{ steps.dispatch.outputs.dispatched }}
+    steps:
+      - name: Filter to approval events
+        id: filter
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REVIEW_STATE: ${{ github.event.review.state }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" != "pull_request_review" ]; then
+            echo "::notice::Not a pull_request_review event ($EVENT_NAME); no-op."
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # GitHub uses lowercase "approved" for review state; case-insensitive match.
+          if [ "$(echo "$REVIEW_STATE" | tr '[:upper:]' '[:lower:]')" != "approved" ]; then
+            echo "::notice::Review state is '$REVIEW_STATE', not 'approved'; no-op."
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "proceed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout
+        if: steps.filter.outputs.proceed == 'true'
+        uses: actions/checkout@v4
+
+      - name: Resolve approver eligibility
+        if: steps.filter.outputs.proceed == 'true'
+        id: resolve
+        uses: infinity-constellation/ci-workflows/.github/actions/devops-agent-resolve-approver@main
+        with:
+          approver-login: ${{ github.event.review.user.login }}
+          affected-paths: ${{ inputs.affected-paths }}
+          codeowners-path: ${{ inputs.codeowners-path }}
+          github-token: ${{ github.token }}
+
+      - name: Comment ineligible approval
+        if: steps.filter.outputs.proceed == 'true' && steps.resolve.outputs.eligible != 'true'
+        uses: actions/github-script@v7
+        env:
+          REASON: ${{ steps.resolve.outputs.reason }}
+          COVERING: ${{ steps.resolve.outputs.covering-owners }}
+          UNOWNED: ${{ steps.resolve.outputs.unowned-paths }}
+          APPROVER: ${{ github.event.review.user.login }}
+        with:
+          script: |
+            const marker = `<!-- devops-agent-approval-${process.env.APPROVER} -->`;
+            const reason = process.env.REASON;
+            const covering = JSON.parse(process.env.COVERING || '[]');
+            const unowned = JSON.parse(process.env.UNOWNED || '[]');
+
+            const lines = [
+              marker,
+              `### gravity-devops-agent — Approval not yet sufficient ⏸️`,
+              '',
+              `Approver: @${process.env.APPROVER}`,
+              '',
+              reason,
+            ];
+            if (unowned.length > 0) {
+              lines.push('', `**Paths with no CODEOWNERS rule** (add ownership to enable auto-apply):`);
+              for (const p of unowned) lines.push(`- \`${p}\``);
+            } else if (covering.length > 0) {
+              lines.push('', `**Owners that together cover this PR** (any one is sufficient):`);
+              for (const o of covering) lines.push(`- ${o}`);
+            }
+            lines.push('', '_The approval was recorded by GitHub but did not trigger an apply._');
+
+            const body = lines.join('\n');
+            const { owner, repo } = context.repo;
+            const issue_number = context.payload.pull_request.number;
+            const { data: comments } = await github.rest.issues.listComments({ owner, repo, issue_number, per_page: 100 });
+            const existing = comments.find(c => c.body && c.body.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number, body });
+            }
+
+      - name: Dispatch apply
+        if: steps.filter.outputs.proceed == 'true' && steps.resolve.outputs.eligible == 'true'
+        id: dispatch
+        env:
+          APPLY_REF: ${{ inputs.apply-workflow-ref }}
+          STACKS_JSON: ${{ inputs.stacks }}
+          AUTO_MERGE: ${{ inputs.auto-merge }}
+          DESTROY_CONFIRMED: ${{ inputs.destroy-confirmed }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          APPROVER_LOGIN: ${{ github.event.review.user.login }}
+          REPO: ${{ github.repository }}
+          REF: ${{ github.ref }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          # Dispatch the apply workflow on the same repo. We pass inputs as
+          # JSON to avoid GH Actions input-size limits on long string args.
+          INPUTS_JSON=$(jq -n \
+            --argjson pr "$PR_NUMBER" \
+            --arg head "$HEAD_SHA" \
+            --argjson stacks "$STACKS_JSON" \
+            --arg approver "$APPROVER_LOGIN" \
+            --argjson auto_merge "$AUTO_MERGE" \
+            --argjson destroy_confirmed "$DESTROY_CONFIRMED" \
+            '{pr_number: $pr, head_sha: $head, stacks: ($stacks | tostring), approver_login: $approver, auto_merge: $auto_merge, destroy_confirmed: $destroy_confirmed}')
+
+          # gh workflow run takes -f key=value; build args.
+          ARGS=()
+          for key in pr_number head_sha approver_login auto_merge destroy_confirmed; do
+            VAL=$(echo "$INPUTS_JSON" | jq -r --arg k "$key" '.[$k]')
+            ARGS+=(-f "$key=$VAL")
+          done
+          # Stacks is JSON-encoded as a string input.
+          STACKS_STR=$(echo "$INPUTS_JSON" | jq -r '.stacks')
+          ARGS+=(-f "stacks=$STACKS_STR")
+
+          # Dispatch on the PR head ref so the apply workflow's
+          # `actions/checkout` defaults pick up the right commit.
+          gh workflow run "$APPLY_REF" \
+            --repo "$REPO" \
+            --ref "$HEAD_SHA" \
+            "${ARGS[@]}"
+
+          echo "Dispatched apply workflow for PR #$PR_NUMBER (head=$HEAD_SHA, approver=$APPROVER_LOGIN)"
+          echo "dispatched=true" >> "$GITHUB_OUTPUT"
+
+      - name: Comment apply queued
+        if: steps.filter.outputs.proceed == 'true' && steps.dispatch.outputs.dispatched == 'true'
+        uses: actions/github-script@v7
+        env:
+          APPROVER: ${{ github.event.review.user.login }}
+          STACKS_JSON: ${{ inputs.stacks }}
+        with:
+          script: |
+            const marker = `<!-- devops-agent-approval-${process.env.APPROVER} -->`;
+            const stacks = JSON.parse(process.env.STACKS_JSON || '[]').map(s => s.stack_id);
+            const stackList = stacks.map(s => `- \`${s}\``).join('\n');
+            const body = [
+              marker,
+              `### gravity-devops-agent — Apply queued ▶️`,
+              '',
+              `Approval by @${process.env.APPROVER} covers all affected paths per CODEOWNERS. Apply dispatched in dependency order.`,
+              '',
+              `**Stacks**:`,
+              stackList,
+              '',
+              `On success: PR will be auto-squash-merged with a structured trailer.`,
+              `On failure: approvals will be dismissed and a postmortem comment posted.`,
+            ].join('\n');
+
+            const { owner, repo } = context.repo;
+            const issue_number = context.payload.pull_request.number;
+            const { data: comments } = await github.rest.issues.listComments({ owner, repo, issue_number, per_page: 100 });
+            const existing = comments.find(c => c.body && c.body.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number, body });
+            }

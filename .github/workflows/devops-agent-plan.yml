@@ -1,0 +1,407 @@
+name: gravity-devops-agent — plan
+
+# Reusable workflow: per-stack `terragrunt plan` (or raw `terraform plan`)
+# triggered on a pull request. Posts a sticky PR comment per stack, uploads
+# the binary plan as an artifact, optionally gates on a Conftest/OPA policy
+# bundle.
+#
+# This is the v0 (CI-bound) implementation of the gravity-devops-agent's
+# plan-on-PR behavior. v1 will replace the workflow body with a bridge
+# subscriber in src/gravity_agent/bridges/devops/, but the external contract
+# (artifacts, comments, status checks) is preserved so callers don't change
+# when the brain moves into Gravity.
+#
+# Engine auto-detection:
+#   - If <working-directory>/terragrunt.hcl exists (and is not in .terragrunt-cache),
+#     uses Terragrunt.
+#   - Else if any *.tf or *.tofu file exists, uses raw Terraform/OpenTofu.
+#   - Else fails with a clear error.
+# The detected engine is recorded in the artifact so the apply workflow uses
+# the same engine.
+#
+# The artifact name is deterministic so the apply workflow can find it by
+# stack-id + run-id.
+
+on:
+  workflow_call:
+    inputs:
+      working-directory:
+        description: "Stack directory (relative to repo root). Required."
+        required: true
+        type: string
+      stack-id:
+        description: "Stable identifier used in artifact names and PR comments. Defaults to working-directory with '/' replaced by '-'."
+        required: false
+        type: string
+        default: ""
+      terraform-version:
+        description: "Terraform version to install."
+        required: false
+        type: string
+        default: "1.15.2"
+      terragrunt-version:
+        description: "Terragrunt version to install. Used only when terragrunt.hcl is detected."
+        required: false
+        type: string
+        default: "0.99.5"
+      aws-role-to-assume:
+        description: "ARN of the AWS role to assume via OIDC. Defaults to vars.AWS_TF_ROLE_TO_ASSUME."
+        required: false
+        type: string
+        default: ""
+      aws-region:
+        description: "AWS region. Defaults to vars.AWS_REGION, then us-east-2."
+        required: false
+        type: string
+        default: ""
+      policy-dir:
+        description: "Path to a Conftest/OPA policy directory. When set, runs `conftest test` against the JSON-rendered plan."
+        required: false
+        type: string
+        default: ""
+      conftest-version:
+        description: "Conftest version to install when policy-dir is set."
+        required: false
+        type: string
+        default: "0.59.0"
+      runs-on:
+        description: "Runner label."
+        required: false
+        type: string
+        default: "ubuntu-latest"
+      destroy:
+        description: "When true, runs `plan -destroy`. Used by destroy-flow PRs."
+        required: false
+        type: boolean
+        default: false
+    outputs:
+      plan-artifact:
+        description: "Name of the uploaded plan artifact."
+        value: ${{ jobs.plan.outputs.plan-artifact }}
+      stack-id:
+        description: "Resolved stack identifier."
+        value: ${{ jobs.plan.outputs.stack-id }}
+      engine:
+        description: "Detected engine: 'terragrunt' or 'terraform'."
+        value: ${{ jobs.plan.outputs.engine }}
+      has-changes:
+        description: "true if the plan reports any resource changes."
+        value: ${{ jobs.plan.outputs.has-changes }}
+
+permissions:
+  contents: read
+  id-token: write
+  pull-requests: write
+
+jobs:
+  plan:
+    runs-on: ${{ inputs.runs-on }}
+    outputs:
+      plan-artifact: ${{ steps.resolve.outputs.plan_artifact }}
+      stack-id: ${{ steps.resolve.outputs.stack_id }}
+      engine: ${{ steps.detect.outputs.engine }}
+      has-changes: ${{ steps.summarize.outputs.has_changes }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve configuration
+        id: resolve
+        env:
+          INPUT_WORKING_DIRECTORY: ${{ inputs.working-directory }}
+          INPUT_STACK_ID: ${{ inputs.stack-id }}
+          INPUT_AWS_REGION: ${{ inputs.aws-region }}
+          INPUT_AWS_ROLE_TO_ASSUME: ${{ inputs.aws-role-to-assume }}
+          VAR_AWS_REGION: ${{ vars.AWS_REGION }}
+          VAR_AWS_TF_ROLE_TO_ASSUME: ${{ vars.AWS_TF_ROLE_TO_ASSUME }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "$INPUT_WORKING_DIRECTORY" ]; then
+            echo "::error::Input working-directory is required."
+            exit 1
+          fi
+          if [ ! -d "$INPUT_WORKING_DIRECTORY" ]; then
+            echo "::error::working-directory '$INPUT_WORKING_DIRECTORY' does not exist."
+            exit 1
+          fi
+
+          STACK_ID="$INPUT_STACK_ID"
+          if [ -z "$STACK_ID" ]; then
+            STACK_ID=$(echo "$INPUT_WORKING_DIRECTORY" | tr '/' '-' | sed 's/^-//;s/-$//')
+          fi
+
+          AWS_REGION="${INPUT_AWS_REGION:-${VAR_AWS_REGION:-us-east-2}}"
+          AWS_ROLE_TO_ASSUME="${INPUT_AWS_ROLE_TO_ASSUME:-${VAR_AWS_TF_ROLE_TO_ASSUME:-}}"
+
+          if [ -z "$AWS_ROLE_TO_ASSUME" ]; then
+            echo "::error::Missing AWS role. Set input aws-role-to-assume or repo var AWS_TF_ROLE_TO_ASSUME."
+            exit 1
+          fi
+
+          # Plan-artifact name is the contract the apply workflow consumes.
+          # Keyed on stack-id + caller run-id + attempt so it's stable per
+          # CI run.
+          PLAN_ARTIFACT="devops-agent-plan-${STACK_ID}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+
+          {
+            echo "stack_id=$STACK_ID"
+            echo "aws_region=$AWS_REGION"
+            echo "aws_role_to_assume=$AWS_ROLE_TO_ASSUME"
+            echo "plan_artifact=$PLAN_ARTIFACT"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Detect engine
+        id: detect
+        working-directory: ${{ inputs.working-directory }}
+        run: |
+          set -euo pipefail
+          if [ -f terragrunt.hcl ]; then
+            ENGINE=terragrunt
+          elif compgen -G "*.tf" > /dev/null || compgen -G "*.tofu" > /dev/null; then
+            ENGINE=terraform
+          else
+            echo "::error::No terragrunt.hcl, *.tf, or *.tofu in $PWD; cannot detect engine."
+            exit 1
+          fi
+          echo "engine=$ENGINE" >> "$GITHUB_OUTPUT"
+          echo "Detected engine: $ENGINE"
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ inputs.terraform-version }}
+          terraform_wrapper: false
+
+      - name: Set up Terragrunt
+        if: ${{ steps.detect.outputs.engine == 'terragrunt' }}
+        env:
+          TG_VERSION: ${{ inputs.terragrunt-version }}
+        run: |
+          set -euo pipefail
+          curl -fsSL "https://github.com/gruntwork-io/terragrunt/releases/download/v${TG_VERSION}/terragrunt_linux_amd64" \
+            -o /usr/local/bin/terragrunt
+          chmod +x /usr/local/bin/terragrunt
+          terragrunt --version
+
+      - name: Set up Conftest
+        if: ${{ inputs.policy-dir != '' }}
+        env:
+          CONFTEST_VERSION: ${{ inputs.conftest-version }}
+        run: |
+          set -euo pipefail
+          curl -fsSL "https://github.com/open-policy-agent/conftest/releases/download/v${CONFTEST_VERSION}/conftest_${CONFTEST_VERSION}_Linux_x86_64.tar.gz" \
+            | tar -xz -C /usr/local/bin conftest
+          conftest --version
+
+      - name: Configure AWS (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ steps.resolve.outputs.aws_role_to_assume }}
+          aws-region: ${{ steps.resolve.outputs.aws_region }}
+          role-session-name: devops-agent-plan-${{ steps.resolve.outputs.stack_id }}-${{ github.run_id }}
+
+      - name: Init
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          ENGINE: ${{ steps.detect.outputs.engine }}
+        run: |
+          set -euo pipefail
+          if [ "$ENGINE" = "terragrunt" ]; then
+            terragrunt init --non-interactive -reconfigure
+          else
+            terraform init -reconfigure -input=false
+          fi
+
+      - name: Plan
+        id: plan
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          ENGINE: ${{ steps.detect.outputs.engine }}
+          DESTROY: ${{ inputs.destroy }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/plan"
+
+          PLAN_ARGS=(-no-color -input=false -lock-timeout=10m -out="$RUNNER_TEMP/plan/plan.bin")
+          if [ "$DESTROY" = "true" ]; then
+            PLAN_ARGS+=(-destroy)
+          fi
+
+          # detailed-exitcode: 0=no diff, 1=error, 2=diff. Treat 1 as failure.
+          set +e
+          if [ "$ENGINE" = "terragrunt" ]; then
+            terragrunt plan --non-interactive -detailed-exitcode "${PLAN_ARGS[@]}" \
+              2>&1 | tee "$RUNNER_TEMP/plan/plan.txt"
+          else
+            terraform plan -detailed-exitcode "${PLAN_ARGS[@]}" \
+              2>&1 | tee "$RUNNER_TEMP/plan/plan.txt"
+          fi
+          PLAN_EXIT=${PIPESTATUS[0]}
+          set -e
+
+          if [ "$PLAN_EXIT" = "1" ]; then
+            echo "::error::Plan failed for $PWD"
+            exit 1
+          fi
+
+          # Render JSON for Conftest and the summary.
+          terraform show -json "$RUNNER_TEMP/plan/plan.bin" > "$RUNNER_TEMP/plan/plan.json"
+
+          # Record metadata so the apply workflow validates engine match.
+          jq -n \
+            --arg engine "$ENGINE" \
+            --arg stack_id "${{ steps.resolve.outputs.stack_id }}" \
+            --arg destroy "$DESTROY" \
+            --arg run_id "$GITHUB_RUN_ID" \
+            --arg head_sha "$GITHUB_SHA" \
+            '{engine: $engine, stack_id: $stack_id, destroy: ($destroy == "true"), run_id: $run_id, head_sha: $head_sha}' \
+            > "$RUNNER_TEMP/plan/metadata.json"
+
+          {
+            echo "plan_dir=$RUNNER_TEMP/plan"
+            echo "plan_exit=$PLAN_EXIT"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Conftest gate
+        if: ${{ inputs.policy-dir != '' }}
+        env:
+          POLICY_DIR: ${{ inputs.policy-dir }}
+          PLAN_DIR: ${{ steps.plan.outputs.plan_dir }}
+        run: |
+          set -euo pipefail
+          conftest test --policy "$POLICY_DIR" "$PLAN_DIR/plan.json"
+
+      - name: Summarize plan
+        id: summarize
+        env:
+          PLAN_DIR: ${{ steps.plan.outputs.plan_dir }}
+          PLAN_EXIT: ${{ steps.plan.outputs.plan_exit }}
+          STACK_ID: ${{ steps.resolve.outputs.stack_id }}
+          DESTROY: ${{ inputs.destroy }}
+          ENGINE: ${{ steps.detect.outputs.engine }}
+        run: |
+          set -euo pipefail
+
+          HAS_CHANGES=false
+          if [ "$PLAN_EXIT" = "2" ]; then
+            HAS_CHANGES=true
+          fi
+          echo "has_changes=$HAS_CHANGES" >> "$GITHUB_OUTPUT"
+
+          ADDS=$(jq '[.resource_changes[]? | select(.change.actions | index("create"))] | length' "$PLAN_DIR/plan.json")
+          CHANGES=$(jq '[.resource_changes[]? | select(.change.actions | index("update"))] | length' "$PLAN_DIR/plan.json")
+          DESTROYS=$(jq '[.resource_changes[]? | select(.change.actions | index("delete"))] | length' "$PLAN_DIR/plan.json")
+          REPLACES=$(jq '[.resource_changes[]? | select((.change.actions | index("delete")) and (.change.actions | index("create")))] | length' "$PLAN_DIR/plan.json")
+          DESTROY_NAMES=$(jq -r '
+            [.resource_changes[]? | select(.change.actions | index("delete")) | "\(.address) (\(.type))"] | .[]
+          ' "$PLAN_DIR/plan.json" | head -50)
+
+          {
+            echo "stack_id=$STACK_ID"
+            echo "adds=$ADDS"
+            echo "changes=$CHANGES"
+            echo "destroys=$DESTROYS"
+            echo "replaces=$REPLACES"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "## DevOps Agent — Plan: \`$STACK_ID\`"
+            echo ""
+            echo "**Engine**: \`$ENGINE\`"
+            if [ "$DESTROY" = "true" ]; then
+              echo "**Mode**: \`-destroy\`"
+            fi
+            echo "**Adds**: $ADDS  **Changes**: $CHANGES  **Destroys**: $DESTROYS  **Replaces**: $REPLACES"
+            if [ "$DESTROYS" -gt 0 ] || [ "$REPLACES" -gt 0 ]; then
+              echo ""
+              echo "### Resources DESTROYED or REPLACED"
+              echo ""
+              echo '```'
+              echo "$DESTROY_NAMES"
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload plan artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.resolve.outputs.plan_artifact }}
+          path: ${{ steps.plan.outputs.plan_dir }}
+          retention-days: 14
+          if-no-files-found: error
+
+      - name: Comment plan on PR
+        if: ${{ github.event_name == 'pull_request' }}
+        uses: actions/github-script@v7
+        env:
+          PLAN_DIR: ${{ steps.plan.outputs.plan_dir }}
+          STACK_ID: ${{ steps.resolve.outputs.stack_id }}
+          ENGINE: ${{ steps.detect.outputs.engine }}
+          ADDS: ${{ steps.summarize.outputs.adds }}
+          CHANGES: ${{ steps.summarize.outputs.changes }}
+          DESTROYS: ${{ steps.summarize.outputs.destroys }}
+          REPLACES: ${{ steps.summarize.outputs.replaces }}
+          PLAN_ARTIFACT: ${{ steps.resolve.outputs.plan_artifact }}
+          DESTROY: ${{ inputs.destroy }}
+          POLICY_DIR: ${{ inputs.policy-dir }}
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            const planText = fs.readFileSync(path.join(process.env.PLAN_DIR, 'plan.txt'), 'utf8');
+
+            const MAX = 60000;
+            const body = planText.length > MAX
+              ? planText.slice(0, MAX) + '\n\n... (truncated, see workflow artifact for full plan)'
+              : planText;
+
+            const marker = `<!-- devops-agent-plan:${process.env.STACK_ID} -->`;
+            const destroyBanner = process.env.DESTROY === 'true'
+              ? '> :warning: **DESTROY PLAN** — this PR is plan-as-destroy.\n\n'
+              : '';
+            const policyLine = process.env.POLICY_DIR
+              ? `Policy: \`${process.env.POLICY_DIR}\` ✅\n`
+              : 'Policy: _none configured_\n';
+
+            const header = [
+              marker,
+              `### gravity-devops-agent — Plan \`${process.env.STACK_ID}\``,
+              '',
+              destroyBanner,
+              `**Engine**: \`${process.env.ENGINE}\``,
+              `**Adds**: ${process.env.ADDS}  **Changes**: ${process.env.CHANGES}  **Destroys**: ${process.env.DESTROYS}  **Replaces**: ${process.env.REPLACES}`,
+              '',
+              policyLine,
+              `Artifact: \`${process.env.PLAN_ARTIFACT}\`  (downloadable from the workflow run)`,
+              '',
+              'When this PR is approved by a CODEOWNER for every affected path, the DevOps Agent will apply this plan in dependency order and auto-merge on success. On failure, approvals are dismissed and a postmortem comment is posted.',
+              '',
+              '<details><summary>Full plan output</summary>',
+              '',
+              '```hcl',
+              body,
+              '```',
+              '',
+              '</details>',
+            ].join('\n');
+
+            const { owner, repo } = context.repo;
+            const issue_number = context.payload.pull_request.number;
+
+            const { data: comments } = await github.rest.issues.listComments({
+              owner, repo, issue_number, per_page: 100,
+            });
+            const existing = comments.find(c =>
+              c.user && c.user.type === 'Bot' && c.body && c.body.includes(marker)
+            );
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner, repo, comment_id: existing.id, body: header,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner, repo, issue_number, body: header,
+              });
+            }
