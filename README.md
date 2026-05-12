@@ -34,6 +34,8 @@ canonical Python `uv` lint/build pipeline across the org.
 - [`temporal-replay-test.yml`](#temporal-replay-testyml--temporal-workflow-replay-tests) — Run Temporal workflow replay tests for a Python `uv` project.
 - [`docker-ecr-release.yml`](#docker-ecr-releaseyml--build-and-optionally-push-a-docker-image-to-ecr) — Build and optionally push a Docker image to ECR.
 - [`notify-release.yml`](#notify-releaseyml--slack-release-notification) — Slack release notification.
+- [`terragrunt-plan.yml`](#terragrunt-planyml--terragrunt-plan-on-pr) — Plan a Terragrunt stack on a PR; post sticky comment, upload artifact, optional Conftest gate.
+- [`terragrunt-apply.yml`](#terragrunt-applyyml--terragrunt-apply-from-saved-plan) — Apply a saved Terragrunt plan after merge to `main`.
 
 ### `python-uv-lint.yml` — Lint a Python `uv` project
 
@@ -287,3 +289,132 @@ gh secret set SLACK_WEBHOOK_URL \
   --repo infinity-constellation/<repo> \
   --body "https://hooks.slack.com/services/..."
 ```
+
+### `terragrunt-plan.yml` — Terragrunt plan on PR
+
+Runs `terragrunt plan` against a single stack, uploads the binary plan as a
+workflow artifact, and posts (or updates) a sticky PR comment with the
+human-readable plan. Optionally runs a Conftest/OPA policy gate against the
+JSON-rendered plan.
+
+The companion `terragrunt-apply.yml` consumes the artifact this workflow
+uploads.
+
+This workflow exists because Terragrunt apply/destroy from developer laptops
+is the documented failure mode behind the 2026-05-12 `gravity-{web,api,agent}`
+incident; see
+[ADR-0009](https://github.com/infinity-constellation/gravity-docs/blob/main/decisions/ADR-0009-iac-orchestration.md)
+in `gravity-docs` (local-only) and the destroy-guardrails section in
+`devshop-infra/AGENTS.md`.
+
+**Usage — typical caller in `devshop-infra`**
+
+```yaml
+plan-stack:
+  uses: infinity-constellation/ci-workflows/.github/workflows/terragrunt-plan.yml@main
+  with:
+    working-directory: live/infinity/aws/sso
+    policy-dir: policies/conftest
+  permissions:
+    contents: read
+    id-token: write
+    pull-requests: write
+```
+
+**Usage — destroy plan**
+
+```yaml
+plan-destroy-stack:
+  if: contains(github.event.pull_request.labels.*.name, 'tf:destroy')
+  uses: infinity-constellation/ci-workflows/.github/workflows/terragrunt-plan.yml@main
+  with:
+    working-directory: live/infinity/aws/staging/us-east-2/some-old-db
+    destroy: true
+    policy-dir: policies/conftest
+```
+
+**Inputs**
+
+| Input | Required | Default | Description |
+|---|---|---|---|
+| `working-directory` | yes | — | Terragrunt stack directory relative to repo root. |
+| `stack-id` | no | derived | Stable identifier for artifacts and PR comments. Defaults to `working-directory` with `/` replaced by `-`. |
+| `terraform-version` | no | `1.14.8` | Terraform version. |
+| `terragrunt-version` | no | `0.99.5` | Terragrunt version. |
+| `aws-role-to-assume` | no | repo var `AWS_TF_ROLE_TO_ASSUME` | OIDC role ARN. |
+| `aws-region` | no | repo var `AWS_REGION`, then `us-east-2` | AWS region. |
+| `policy-dir` | no | _(empty)_ | Conftest/OPA policy directory. Empty disables the gate. |
+| `conftest-version` | no | `0.59.0` | Conftest version when policy-dir is set. |
+| `destroy` | no | `false` | Run `terragrunt plan -destroy`. |
+| `runs-on` | no | `ubuntu-latest` | Runner label. |
+
+**Outputs**
+
+| Output | Description |
+|---|---|
+| `plan-artifact` | Name of the uploaded artifact, suitable for `terragrunt-apply.yml` `plan-artifact-name`. |
+| `plan-summary-path` | Path within the artifact to `plan.txt`. |
+| `stack-id` | Resolved stack identifier. |
+| `has-changes` | `"true"` if the plan reports any resource changes. |
+
+**Required repo configuration**
+
+- Repository variable `AWS_TF_ROLE_TO_ASSUME` (or per-call input) — ARN of an
+  IAM role trusted by the GitHub OIDC provider for read-mostly Terraform
+  operations. The role's trust policy MUST include both `pull_request` and
+  `push:main` refs.
+- AWS S3 + DynamoDB Terraform state backend reachable from the role's
+  permissions. The role needs at minimum: `s3:GetObject`/`PutObject`/`ListBucket`
+  on the state bucket, `dynamodb:GetItem`/`PutItem`/`DeleteItem` on the lock
+  table, plus read-only access to the AWS APIs the stack queries.
+
+### `terragrunt-apply.yml` — Terragrunt apply from saved plan
+
+Applies a previously-generated `terragrunt plan` artifact against a single
+stack. Designed to be invoked on a `push: branches: [main]` event after a PR
+that ran `terragrunt-plan.yml` is merged.
+
+Refuses to apply unless:
+
+- The plan artifact is downloadable.
+- When `destroy: true`, `destroy-confirmed: true` is also set (wire this to a
+  PR-label check or environment approval in the caller).
+- When `destroy: true`, the saved plan contains only delete actions.
+
+**Usage — typical caller in `devshop-infra`**
+
+```yaml
+apply-stack:
+  uses: infinity-constellation/ci-workflows/.github/workflows/terragrunt-apply.yml@main
+  with:
+    working-directory: live/infinity/aws/sso
+    plan-artifact-name: ${{ needs.plan.outputs.plan-artifact }}
+    plan-run-id: ${{ needs.plan.outputs.plan-run-id }}
+  permissions:
+    contents: read
+    id-token: write
+```
+
+**Inputs**
+
+| Input | Required | Default | Description |
+|---|---|---|---|
+| `working-directory` | yes | — | Terragrunt stack directory; must match the plan. |
+| `stack-id` | no | derived | Stable identifier. |
+| `plan-artifact-name` | yes | — | Name of the artifact from `terragrunt-plan.yml`. |
+| `plan-run-id` | no | _(current run)_ | Run ID of the workflow that produced the artifact. Required when downloading from a prior run (e.g. the merged PR's plan). |
+| `terraform-version` | no | `1.14.8` | Should match plan workflow. |
+| `terragrunt-version` | no | `0.99.5` | Should match plan workflow. |
+| `aws-role-to-assume` | no | repo var `AWS_TF_APPLY_ROLE_TO_ASSUME` then `AWS_TF_ROLE_TO_ASSUME` | OIDC role ARN. Apply prefers a dedicated apply role. |
+| `aws-region` | no | repo var `AWS_REGION`, then `us-east-2` | AWS region. |
+| `destroy` | no | `false` | The saved plan must be a `-destroy` plan. |
+| `destroy-confirmed` | no | `false` | Must be `true` to allow a destroy apply. |
+| `runs-on` | no | `ubuntu-latest` | Runner label. |
+
+**Required repo configuration**
+
+- Repository variable `AWS_TF_APPLY_ROLE_TO_ASSUME` — distinct ARN for apply,
+  trusted only on `ref:refs/heads/main` (or your protected branch). PR refs
+  MUST NOT have apply trust.
+- Branch protection on `main` requiring the plan check to pass and at least
+  one approving review.

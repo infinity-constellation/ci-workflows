@@ -1,0 +1,241 @@
+name: Terragrunt Apply
+
+# Reusable workflow: applies a previously-generated `terragrunt plan` artifact
+# against a single stack on a `push: branches: [main]` event. Designed to be
+# called by a caller workflow that has already verified, on the merge commit,
+# that the saved plan is still valid (re-plan is intentionally not done here —
+# the caller decides whether to re-plan or apply the saved plan, see
+# gravity-docs/decisions/ADR-0009-iac-orchestration.md "Open questions").
+#
+# This workflow assumes:
+#   - Branch protection on the caller repo's `main` requires a passing plan
+#     check before merge.
+#   - The OIDC role assumed here trusts only `ref:refs/heads/main` for apply
+#     (or the caller's protected branch). PR refs MUST NOT have apply trust.
+#   - The plan artifact name is the deterministic name produced by
+#     terragrunt-plan.yml.
+#
+# Destroy support:
+#   - When `destroy: true`, the saved plan is expected to be a `-destroy` plan
+#     produced by terragrunt-plan.yml with the same `destroy: true` input. The
+#     workflow refuses to apply unless the caller explicitly opts in via the
+#     `destroy-confirmed` input — wire this to a PR label check in the caller.
+
+on:
+  workflow_call:
+    inputs:
+      working-directory:
+        description: "Terragrunt stack directory (relative to repo root). Required, must match the plan."
+        required: true
+        type: string
+      stack-id:
+        description: "Stable identifier for this stack. Defaults to working-directory with '/' replaced by '-'."
+        required: false
+        type: string
+        default: ""
+      plan-artifact-name:
+        description: "Name of the artifact uploaded by terragrunt-plan.yml. Required."
+        required: true
+        type: string
+      plan-run-id:
+        description: "Run ID of the workflow that produced the artifact. Required when the artifact is in a different run than this workflow."
+        required: false
+        type: string
+        default: ""
+      terraform-version:
+        description: "Terraform version. Should match the plan workflow."
+        required: false
+        type: string
+        default: "1.14.8"
+      terragrunt-version:
+        description: "Terragrunt version. Should match the plan workflow."
+        required: false
+        type: string
+        default: "0.99.5"
+      aws-role-to-assume:
+        description: "ARN of the AWS role to assume via OIDC. Defaults to vars.AWS_TF_APPLY_ROLE_TO_ASSUME, then vars.AWS_TF_ROLE_TO_ASSUME."
+        required: false
+        type: string
+        default: ""
+      aws-region:
+        description: "AWS region. Defaults to vars.AWS_REGION, then us-east-2."
+        required: false
+        type: string
+        default: ""
+      destroy:
+        description: "When true, the saved plan must be a -destroy plan and `destroy-confirmed` must also be true."
+        required: false
+        type: boolean
+        default: false
+      destroy-confirmed:
+        description: "Must be true to allow a destroy apply. Wire this to a PR label or environment approval in the caller."
+        required: false
+        type: boolean
+        default: false
+      runs-on:
+        description: "Runner label."
+        required: false
+        type: string
+        default: "ubuntu-latest"
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  apply:
+    runs-on: ${{ inputs.runs-on }}
+    steps:
+      - name: Refuse unsafe destroy
+        if: ${{ inputs.destroy && !inputs.destroy-confirmed }}
+        run: |
+          echo "::error::destroy=true requires destroy-confirmed=true. Refusing to apply."
+          exit 1
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve configuration
+        id: resolve
+        env:
+          INPUT_WORKING_DIRECTORY: ${{ inputs.working-directory }}
+          INPUT_STACK_ID: ${{ inputs.stack-id }}
+          INPUT_AWS_REGION: ${{ inputs.aws-region }}
+          INPUT_AWS_ROLE_TO_ASSUME: ${{ inputs.aws-role-to-assume }}
+          VAR_AWS_REGION: ${{ vars.AWS_REGION }}
+          VAR_AWS_TF_APPLY_ROLE: ${{ vars.AWS_TF_APPLY_ROLE_TO_ASSUME }}
+          VAR_AWS_TF_ROLE: ${{ vars.AWS_TF_ROLE_TO_ASSUME }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "$INPUT_WORKING_DIRECTORY" ]; then
+            echo "Input working-directory is required." >&2
+            exit 1
+          fi
+          if [ ! -d "$INPUT_WORKING_DIRECTORY" ]; then
+            echo "working-directory '$INPUT_WORKING_DIRECTORY' does not exist." >&2
+            exit 1
+          fi
+
+          STACK_ID="$INPUT_STACK_ID"
+          if [ -z "$STACK_ID" ]; then
+            STACK_ID=$(echo "$INPUT_WORKING_DIRECTORY" | tr '/' '-' | sed 's/^-//;s/-$//')
+          fi
+
+          AWS_REGION="${INPUT_AWS_REGION:-${VAR_AWS_REGION:-us-east-2}}"
+          # Apply prefers a dedicated apply role; falls back to the plan role.
+          AWS_ROLE_TO_ASSUME="${INPUT_AWS_ROLE_TO_ASSUME:-${VAR_AWS_TF_APPLY_ROLE:-${VAR_AWS_TF_ROLE:-}}}"
+
+          if [ -z "$AWS_ROLE_TO_ASSUME" ]; then
+            echo "Missing AWS role. Set input aws-role-to-assume or vars AWS_TF_APPLY_ROLE_TO_ASSUME / AWS_TF_ROLE_TO_ASSUME." >&2
+            exit 1
+          fi
+
+          {
+            echo "stack_id=$STACK_ID"
+            echo "aws_region=$AWS_REGION"
+            echo "aws_role_to_assume=$AWS_ROLE_TO_ASSUME"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ inputs.terraform-version }}
+          terraform_wrapper: false
+
+      - name: Set up Terragrunt
+        env:
+          TG_VERSION: ${{ inputs.terragrunt-version }}
+        run: |
+          set -euo pipefail
+          curl -fsSL "https://github.com/gruntwork-io/terragrunt/releases/download/v${TG_VERSION}/terragrunt_linux_amd64" \
+            -o /usr/local/bin/terragrunt
+          chmod +x /usr/local/bin/terragrunt
+          terragrunt --version
+
+      - name: Download plan artifact (current run)
+        if: ${{ inputs.plan-run-id == '' }}
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.plan-artifact-name }}
+          path: ${{ runner.temp }}/plan
+
+      - name: Download plan artifact (prior run)
+        if: ${{ inputs.plan-run-id != '' }}
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.plan-artifact-name }}
+          path: ${{ runner.temp }}/plan
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.plan-run-id }}
+
+      - name: Validate downloaded plan
+        env:
+          DESTROY: ${{ inputs.destroy }}
+        run: |
+          set -euo pipefail
+          if [ ! -f "$RUNNER_TEMP/plan/plan.bin" ]; then
+            echo "::error::plan.bin not found in artifact"
+            exit 1
+          fi
+          if [ ! -f "$RUNNER_TEMP/plan/plan.json" ]; then
+            echo "::error::plan.json not found in artifact"
+            exit 1
+          fi
+
+          # Sanity-check that the destroy bit matches the saved plan.
+          DESTROY_COUNT=$(jq '[.resource_changes[]? | select(.change.actions == ["delete"])] | length' "$RUNNER_TEMP/plan/plan.json")
+          NON_DESTROY_COUNT=$(jq '[.resource_changes[]? | select(.change.actions != ["delete"] and (.change.actions | length > 0) and (.change.actions != ["no-op"]))] | length' "$RUNNER_TEMP/plan/plan.json")
+
+          if [ "$DESTROY" = "true" ]; then
+            if [ "$NON_DESTROY_COUNT" -gt 0 ]; then
+              echo "::error::destroy=true but plan contains $NON_DESTROY_COUNT non-delete actions. Refusing."
+              exit 1
+            fi
+            if [ "$DESTROY_COUNT" -eq 0 ]; then
+              echo "::error::destroy=true but plan contains 0 delete actions. Refusing."
+              exit 1
+            fi
+            echo "Destroy plan validated: $DESTROY_COUNT resources will be deleted."
+          fi
+
+      - name: Configure AWS (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ steps.resolve.outputs.aws_role_to_assume }}
+          aws-region: ${{ steps.resolve.outputs.aws_region }}
+          role-session-name: terragrunt-apply-${{ steps.resolve.outputs.stack_id }}-${{ github.run_id }}
+
+      - name: Terragrunt init
+        working-directory: ${{ inputs.working-directory }}
+        run: |
+          set -euo pipefail
+          terragrunt init --non-interactive -reconfigure
+
+      - name: Terragrunt apply (saved plan)
+        working-directory: ${{ inputs.working-directory }}
+        run: |
+          set -euo pipefail
+          # Apply the saved plan. No -auto-approve flag is needed for plan-file
+          # apply, but we pass --non-interactive so terragrunt itself doesn't
+          # prompt. Stream full output to the job log.
+          terragrunt apply --non-interactive -input=false -no-color \
+            "$RUNNER_TEMP/plan/plan.bin"
+
+      - name: Summarize apply
+        if: ${{ always() }}
+        env:
+          STACK_ID: ${{ steps.resolve.outputs.stack_id }}
+          DESTROY: ${{ inputs.destroy }}
+          STATUS: ${{ job.status }}
+        run: |
+          {
+            echo "## Terragrunt Apply — \`$STACK_ID\`"
+            echo ""
+            if [ "$DESTROY" = "true" ]; then
+              echo "**Mode**: \`-destroy\`"
+            fi
+            echo "**Status**: $STATUS"
+            echo "**Plan artifact**: \`${{ inputs.plan-artifact-name }}\`"
+            echo "**Run**: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          } >> "$GITHUB_STEP_SUMMARY"

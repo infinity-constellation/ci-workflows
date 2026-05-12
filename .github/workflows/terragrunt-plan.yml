@@ -1,0 +1,367 @@
+name: Terragrunt Plan
+
+# Reusable workflow: runs `terragrunt plan` against a single stack on a pull
+# request, posts a sticky PR comment with the plan summary, uploads the binary
+# plan as a workflow artifact, and (optionally) gates the result through a
+# Conftest/OPA policy bundle.
+#
+# This workflow is the read-mostly half of Gravity's IaC orchestration design
+# (see gravity-docs/decisions/ADR-0009-iac-orchestration.md). It is invoked by
+# infra repos (`devshop-infra`, `infinity-k8s-fleet`, etc.) once per stack
+# touched by a PR. The companion `terragrunt-apply.yml` consumes the artifact
+# this workflow uploads.
+#
+# Key design constraints:
+#   - AWS auth is OIDC-only. No static credentials. The role assumed here must
+#     trust the GitHub OIDC provider with a sub-claim that includes both
+#     `pull_request` and `push:main` refs — the apply workflow narrows to
+#     `push:main`.
+#   - Plan output is shown in full. Never `grep`/`head` the plan — the
+#     destroy-loop incident (RCA 2026-05-12) was partly caused by filtering.
+#   - The artifact name is deterministic so `terragrunt-apply.yml` can find it
+#     by name on the post-merge run.
+#   - Conftest is invoked when `policy-dir` is set. Failure is fatal.
+
+on:
+  workflow_call:
+    inputs:
+      working-directory:
+        description: "Terragrunt stack directory (relative to repo root). Required."
+        required: true
+        type: string
+      stack-id:
+        description: "Stable identifier for this stack used in artifact names and PR comments. Defaults to working-directory with '/' replaced by '-'."
+        required: false
+        type: string
+        default: ""
+      terraform-version:
+        description: "Terraform version to install."
+        required: false
+        type: string
+        default: "1.14.8"
+      terragrunt-version:
+        description: "Terragrunt version to install."
+        required: false
+        type: string
+        default: "0.99.5"
+      aws-role-to-assume:
+        description: "ARN of the AWS role to assume via OIDC. Defaults to vars.AWS_TF_ROLE_TO_ASSUME."
+        required: false
+        type: string
+        default: ""
+      aws-region:
+        description: "AWS region. Defaults to vars.AWS_REGION, then us-east-2."
+        required: false
+        type: string
+        default: ""
+      policy-dir:
+        description: "Path to a Conftest/OPA policy directory. When set, runs `conftest test` against the JSON-rendered plan. Empty = skip policy gate."
+        required: false
+        type: string
+        default: ""
+      conftest-version:
+        description: "Conftest version to install when policy-dir is set."
+        required: false
+        type: string
+        default: "0.59.0"
+      runs-on:
+        description: "Runner label."
+        required: false
+        type: string
+        default: "ubuntu-latest"
+      destroy:
+        description: "When true, runs `terragrunt plan -destroy`. Used by destroy-flow PRs."
+        required: false
+        type: boolean
+        default: false
+    outputs:
+      plan-artifact:
+        description: "Name of the uploaded plan artifact, suitable for terragrunt-apply.yml plan-artifact-name input."
+        value: ${{ jobs.plan.outputs.plan-artifact }}
+      plan-summary-path:
+        description: "Path within the artifact to the human-readable plan summary."
+        value: "plan.txt"
+      stack-id:
+        description: "Resolved stack identifier."
+        value: ${{ jobs.plan.outputs.stack-id }}
+      has-changes:
+        description: "true if the plan reports any resource changes; false otherwise."
+        value: ${{ jobs.plan.outputs.has-changes }}
+
+permissions:
+  contents: read
+  id-token: write
+  pull-requests: write
+
+jobs:
+  plan:
+    runs-on: ${{ inputs.runs-on }}
+    outputs:
+      plan-artifact: ${{ steps.resolve.outputs.plan_artifact }}
+      stack-id: ${{ steps.resolve.outputs.stack_id }}
+      has-changes: ${{ steps.summarize.outputs.has_changes }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve configuration
+        id: resolve
+        env:
+          INPUT_WORKING_DIRECTORY: ${{ inputs.working-directory }}
+          INPUT_STACK_ID: ${{ inputs.stack-id }}
+          INPUT_AWS_REGION: ${{ inputs.aws-region }}
+          INPUT_AWS_ROLE_TO_ASSUME: ${{ inputs.aws-role-to-assume }}
+          VAR_AWS_REGION: ${{ vars.AWS_REGION }}
+          VAR_AWS_TF_ROLE_TO_ASSUME: ${{ vars.AWS_TF_ROLE_TO_ASSUME }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "$INPUT_WORKING_DIRECTORY" ]; then
+            echo "Input working-directory is required." >&2
+            exit 1
+          fi
+          if [ ! -d "$INPUT_WORKING_DIRECTORY" ]; then
+            echo "working-directory '$INPUT_WORKING_DIRECTORY' does not exist." >&2
+            exit 1
+          fi
+
+          STACK_ID="$INPUT_STACK_ID"
+          if [ -z "$STACK_ID" ]; then
+            STACK_ID=$(echo "$INPUT_WORKING_DIRECTORY" | tr '/' '-' | sed 's/^-//;s/-$//')
+          fi
+
+          AWS_REGION="${INPUT_AWS_REGION:-${VAR_AWS_REGION:-us-east-2}}"
+          AWS_ROLE_TO_ASSUME="${INPUT_AWS_ROLE_TO_ASSUME:-${VAR_AWS_TF_ROLE_TO_ASSUME:-}}"
+
+          if [ -z "$AWS_ROLE_TO_ASSUME" ]; then
+            echo "Missing AWS role. Set input aws-role-to-assume or repo var AWS_TF_ROLE_TO_ASSUME." >&2
+            exit 1
+          fi
+
+          PLAN_ARTIFACT="terragrunt-plan-${STACK_ID}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+
+          {
+            echo "stack_id=$STACK_ID"
+            echo "aws_region=$AWS_REGION"
+            echo "aws_role_to_assume=$AWS_ROLE_TO_ASSUME"
+            echo "plan_artifact=$PLAN_ARTIFACT"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ inputs.terraform-version }}
+          terraform_wrapper: false
+
+      - name: Set up Terragrunt
+        env:
+          TG_VERSION: ${{ inputs.terragrunt-version }}
+        run: |
+          set -euo pipefail
+          curl -fsSL "https://github.com/gruntwork-io/terragrunt/releases/download/v${TG_VERSION}/terragrunt_linux_amd64" \
+            -o /usr/local/bin/terragrunt
+          chmod +x /usr/local/bin/terragrunt
+          terragrunt --version
+
+      - name: Set up Conftest
+        if: ${{ inputs.policy-dir != '' }}
+        env:
+          CONFTEST_VERSION: ${{ inputs.conftest-version }}
+        run: |
+          set -euo pipefail
+          curl -fsSL "https://github.com/open-policy-agent/conftest/releases/download/v${CONFTEST_VERSION}/conftest_${CONFTEST_VERSION}_Linux_x86_64.tar.gz" \
+            | tar -xz -C /usr/local/bin conftest
+          conftest --version
+
+      - name: Configure AWS (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ steps.resolve.outputs.aws_role_to_assume }}
+          aws-region: ${{ steps.resolve.outputs.aws_region }}
+          role-session-name: terragrunt-plan-${{ steps.resolve.outputs.stack_id }}-${{ github.run_id }}
+
+      - name: Terragrunt init
+        working-directory: ${{ inputs.working-directory }}
+        run: |
+          set -euo pipefail
+          terragrunt init --non-interactive -reconfigure
+
+      - name: Terragrunt plan
+        id: plan
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          DESTROY: ${{ inputs.destroy }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/plan"
+
+          PLAN_ARGS=(-no-color -input=false -lock-timeout=10m -out="$RUNNER_TEMP/plan/plan.bin")
+          if [ "$DESTROY" = "true" ]; then
+            PLAN_ARGS+=(-destroy)
+          fi
+
+          # Stream full plan to the job log AND capture it for artifact / PR comment.
+          # detailed-exitcode: 0 = no diff, 1 = error, 2 = diff. Treat 1 as failure.
+          set +e
+          terragrunt plan --non-interactive -detailed-exitcode "${PLAN_ARGS[@]}" \
+            2>&1 | tee "$RUNNER_TEMP/plan/plan.txt"
+          PLAN_EXIT=${PIPESTATUS[0]}
+          set -e
+
+          if [ "$PLAN_EXIT" = "1" ]; then
+            echo "::error::Terragrunt plan failed for $PWD"
+            exit 1
+          fi
+
+          # Render JSON for Conftest and a small machine-readable summary.
+          terraform show -json "$RUNNER_TEMP/plan/plan.bin" > "$RUNNER_TEMP/plan/plan.json"
+
+          {
+            echo "plan_dir=$RUNNER_TEMP/plan"
+            echo "plan_exit=$PLAN_EXIT"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Conftest gate
+        if: ${{ inputs.policy-dir != '' }}
+        env:
+          POLICY_DIR: ${{ inputs.policy-dir }}
+          PLAN_DIR: ${{ steps.plan.outputs.plan_dir }}
+        run: |
+          set -euo pipefail
+          conftest test --policy "$POLICY_DIR" "$PLAN_DIR/plan.json"
+
+      - name: Summarize plan
+        id: summarize
+        env:
+          PLAN_DIR: ${{ steps.plan.outputs.plan_dir }}
+          PLAN_EXIT: ${{ steps.plan.outputs.plan_exit }}
+          STACK_ID: ${{ steps.resolve.outputs.stack_id }}
+          DESTROY: ${{ inputs.destroy }}
+        run: |
+          set -euo pipefail
+
+          # has_changes: true if plan exit code was 2.
+          HAS_CHANGES=false
+          if [ "$PLAN_EXIT" = "2" ]; then
+            HAS_CHANGES=true
+          fi
+          echo "has_changes=$HAS_CHANGES" >> "$GITHUB_OUTPUT"
+
+          # Resource counts derived from the JSON plan.
+          ADDS=$(jq '[.resource_changes[]? | select(.change.actions | index("create"))] | length' "$PLAN_DIR/plan.json")
+          CHANGES=$(jq '[.resource_changes[]? | select(.change.actions | index("update"))] | length' "$PLAN_DIR/plan.json")
+          DESTROYS=$(jq '[.resource_changes[]? | select(.change.actions | index("delete"))] | length' "$PLAN_DIR/plan.json")
+          REPLACES=$(jq '[.resource_changes[]? | select((.change.actions | index("delete")) and (.change.actions | index("create")))] | length' "$PLAN_DIR/plan.json")
+
+          DESTROY_NAMES=$(jq -r '
+            [.resource_changes[]? | select(.change.actions | index("delete")) | "\(.address) (\(.type))"] | .[]
+          ' "$PLAN_DIR/plan.json" | head -50)
+
+          {
+            echo "stack_id=$STACK_ID"
+            echo "adds=$ADDS"
+            echo "changes=$CHANGES"
+            echo "destroys=$DESTROYS"
+            echo "replaces=$REPLACES"
+          } >> "$GITHUB_OUTPUT"
+
+          # Append a step summary so the GH UI shows the counts at a glance.
+          {
+            echo "## Terragrunt Plan — \`$STACK_ID\`"
+            echo ""
+            if [ "$DESTROY" = "true" ]; then
+              echo "**Mode**: \`-destroy\`"
+            fi
+            echo "**Adds**: $ADDS  **Changes**: $CHANGES  **Destroys**: $DESTROYS  **Replaces**: $REPLACES"
+            if [ "$DESTROYS" -gt 0 ] || [ "$REPLACES" -gt 0 ]; then
+              echo ""
+              echo "### Resources that will be DESTROYED or REPLACED"
+              echo ""
+              echo '```'
+              echo "$DESTROY_NAMES"
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload plan artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.resolve.outputs.plan_artifact }}
+          path: ${{ steps.plan.outputs.plan_dir }}
+          retention-days: 14
+          if-no-files-found: error
+
+      - name: Comment plan on PR
+        if: ${{ github.event_name == 'pull_request' }}
+        uses: actions/github-script@v7
+        env:
+          PLAN_DIR: ${{ steps.plan.outputs.plan_dir }}
+          STACK_ID: ${{ steps.resolve.outputs.stack_id }}
+          ADDS: ${{ steps.summarize.outputs.adds }}
+          CHANGES: ${{ steps.summarize.outputs.changes }}
+          DESTROYS: ${{ steps.summarize.outputs.destroys }}
+          REPLACES: ${{ steps.summarize.outputs.replaces }}
+          PLAN_ARTIFACT: ${{ steps.resolve.outputs.plan_artifact }}
+          DESTROY: ${{ inputs.destroy }}
+          POLICY_DIR: ${{ inputs.policy-dir }}
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            const planText = fs.readFileSync(path.join(process.env.PLAN_DIR, 'plan.txt'), 'utf8');
+
+            // GitHub comment limit is 65536 chars. Reserve ~3KB for the header and link.
+            const MAX = 60000;
+            const truncated = planText.length > MAX;
+            const body = planText.length > MAX
+              ? planText.slice(0, MAX) + '\n\n... (truncated, see workflow artifact for full plan)'
+              : planText;
+
+            const marker = `<!-- terragrunt-plan:${process.env.STACK_ID} -->`;
+            const destroyBanner = process.env.DESTROY === 'true'
+              ? '> :warning: **DESTROY PLAN** — this PR is plan-as-destroy.\n\n'
+              : '';
+            const policyLine = process.env.POLICY_DIR
+              ? `Policy: \`${process.env.POLICY_DIR}\` ✅\n`
+              : 'Policy: _none configured_\n';
+
+            const header = [
+              marker,
+              `### Terragrunt Plan — \`${process.env.STACK_ID}\``,
+              '',
+              destroyBanner,
+              `**Adds**: ${process.env.ADDS}  **Changes**: ${process.env.CHANGES}  **Destroys**: ${process.env.DESTROYS}  **Replaces**: ${process.env.REPLACES}`,
+              '',
+              policyLine,
+              `Artifact: \`${process.env.PLAN_ARTIFACT}\` (downloadable from the workflow run)`,
+              '',
+              '<details><summary>Full plan output</summary>',
+              '',
+              '```hcl',
+              body,
+              '```',
+              '',
+              '</details>',
+            ].join('\n');
+
+            // Sticky comment: find prior bot comment with our marker and update,
+            // otherwise create a new one.
+            const { owner, repo } = context.repo;
+            const issue_number = context.payload.pull_request.number;
+
+            const { data: comments } = await github.rest.issues.listComments({
+              owner, repo, issue_number, per_page: 100,
+            });
+            const existing = comments.find(c =>
+              c.user && c.user.type === 'Bot' && c.body && c.body.includes(marker)
+            );
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner, repo, comment_id: existing.id, body: header,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner, repo, issue_number, body: header,
+              });
+            }
