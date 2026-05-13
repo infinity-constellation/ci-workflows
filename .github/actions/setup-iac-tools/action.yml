@@ -78,8 +78,16 @@ runs:
         terraform_version: ${{ steps.resolve.outputs.terraform }}
         terraform_wrapper: false
 
-    - name: Install Terragrunt
+    - name: Cache Terragrunt binary
       if: ${{ inputs.install-terragrunt == 'true' }}
+      id: tg-cache
+      uses: actions/cache@v4
+      with:
+        path: /usr/local/bin/terragrunt
+        key: terragrunt-${{ steps.resolve.outputs.terragrunt }}-linux-amd64
+
+    - name: Install Terragrunt
+      if: ${{ inputs.install-terragrunt == 'true' && steps.tg-cache.outputs.cache-hit != 'true' }}
       shell: bash
       env:
         TG_VERSION: ${{ steps.resolve.outputs.terragrunt }}

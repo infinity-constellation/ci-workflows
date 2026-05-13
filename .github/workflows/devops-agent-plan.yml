@@ -108,6 +108,11 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v6
+        with:
+          # Plan jobs only need the working tree, not full git history.
+          # The discover job (in the caller) already ran git diff with full
+          # history; plan just needs the HCL files to be present.
+          fetch-depth: 1
 
       - name: Resolve configuration
         id: resolve
