@@ -56,7 +56,7 @@ jobs:
     runs-on: ${{ inputs.runs-on }}
     steps:
       - name: Dismiss all current approvals
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         env:
           PR_NUMBER: ${{ inputs.pr-number }}
         with:
@@ -83,7 +83,7 @@ jobs:
             }
 
       - name: Add apply-failure label
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         env:
           PR_NUMBER: ${{ inputs.pr-number }}
         with:
@@ -189,7 +189,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Post structured postmortem comment
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         env:
           PR_NUMBER: ${{ inputs.pr-number }}
           FAILED_STACK: ${{ inputs.failed-stack }}

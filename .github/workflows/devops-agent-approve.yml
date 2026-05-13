@@ -93,7 +93,7 @@ jobs:
 
       - name: Checkout
         if: steps.filter.outputs.proceed == 'true'
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Resolve approver eligibility
         if: steps.filter.outputs.proceed == 'true'
@@ -107,7 +107,7 @@ jobs:
 
       - name: Comment ineligible approval
         if: steps.filter.outputs.proceed == 'true' && steps.resolve.outputs.eligible != 'true'
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         env:
           REASON: ${{ steps.resolve.outputs.reason }}
           COVERING: ${{ steps.resolve.outputs.covering-owners }}
@@ -198,7 +198,7 @@ jobs:
 
       - name: Comment apply queued
         if: steps.filter.outputs.proceed == 'true' && steps.dispatch.outputs.dispatched == 'true'
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         env:
           APPROVER: ${{ github.event.review.user.login }}
           STACKS_JSON: ${{ inputs.stacks }}

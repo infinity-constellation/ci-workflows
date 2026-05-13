@@ -91,7 +91,7 @@ jobs:
       pushed: ${{ steps.result.outputs.pushed }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Resolve configuration
         id: resolve
@@ -152,7 +152,7 @@ jobs:
 
       - name: Configure AWS (OIDC)
         if: ${{ inputs.push }}
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@v6
         with:
           role-to-assume: ${{ steps.resolve.outputs.aws_role_to_assume }}
           aws-region: ${{ steps.resolve.outputs.aws_region }}
