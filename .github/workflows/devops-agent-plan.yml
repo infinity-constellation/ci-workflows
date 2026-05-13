@@ -350,9 +350,11 @@ jobs:
           CHANGES=$(jq '[.resource_changes[]? | select(.change.actions | index("update"))] | length' "$PLAN_DIR/plan.json")
           DESTROYS=$(jq '[.resource_changes[]? | select(.change.actions | index("delete"))] | length' "$PLAN_DIR/plan.json")
           REPLACES=$(jq '[.resource_changes[]? | select((.change.actions | index("delete")) and (.change.actions | index("create")))] | length' "$PLAN_DIR/plan.json")
+          # head -50 terminates jq early on large plans; || true prevents SIGPIPE
+          # from propagating as a non-zero exit under set -euo pipefail.
           DESTROY_NAMES=$(jq -r '
             [.resource_changes[]? | select(.change.actions | index("delete")) | "\(.address) (\(.type))"] | .[]
-          ' "$PLAN_DIR/plan.json" | head -50)
+          ' "$PLAN_DIR/plan.json" | head -50 || true)
 
           {
             echo "stack_id=$STACK_ID"
