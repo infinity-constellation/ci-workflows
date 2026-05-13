@@ -318,8 +318,11 @@ external contract (PR comments, artifacts, lifecycle events) is preserved.
 3. **`devops-agent-apply.yml`** — re-checks out the PR head, walks
    `terragrunt graph-dependencies` for the affected stacks, applies each
    stack's saved plan in topological order in a single job. On success: a
-   structured outcome comment is posted and the PR is auto-squash-merged
-   with a trailer block recording approver + applied stacks + run URL. On
+   structured outcome comment is posted and the PR is auto-merged using
+   the configured strategy (default priority: `squash > rebase > merge`,
+   override via the `merge-strategy` input or `DEVOPS_AGENT_MERGE_STRATEGY`
+   repo var). The merge commit (or rebased / squashed last commit) carries
+   a trailer block recording approver + applied stacks + run URL. On
    failure: the postmortem workflow is dispatched.
 4. **`devops-agent-postmortem.yml`** — dismisses every current PR
    approval, adds the `apply-failure` label, and posts a structured
@@ -486,7 +489,20 @@ under `.github/workflows/infra.yml`.
 | `aws-role-to-assume` | no | repo var `AWS_TF_APPLY_ROLE_TO_ASSUME` then `AWS_TF_ROLE_TO_ASSUME` | |
 | `aws-region` | no | as above | |
 | `destroy-confirmed` | no | `false` | Must be `true` if any stack has `destroy=true`. |
-| `auto-merge` | no | `true` | Enable auto-squash-merge on the PR after a successful apply. |
+| `auto-merge` | no | `true` | Enable auto-merge on the PR after a successful apply. Method selected from the merge-strategy priority list. |
+| `merge-strategy` | no | _(empty)_ | Preferred merge strategy: `squash`, `rebase`, `merge`, or empty for default priority. Resolution: this input > `vars.DEVOPS_AGENT_MERGE_STRATEGY` > default priority `squash > rebase > merge`. The agent walks the priority list and picks the first method allowed by the repo, retrying with the next on rejection. |
+
+#### Merge strategy
+
+The agent's auto-merge step is flexible across any infra/devops repo's merge configuration:
+
+1. The agent calls `gh api repos/<owner>/<repo>` to read which methods (`squash`, `rebase`, `merge`) the repo allows.
+2. It builds a priority list. By default that's `squash > rebase > merge` (cleanest audit trail first). An explicit choice via the `merge-strategy` workflow input or `DEVOPS_AGENT_MERGE_STRATEGY` repo variable puts that method at the head of the list; the rest follow in default order as fallbacks.
+3. It walks the list, calling `gh pr merge --auto --<method>`, and stops on the first success.
+4. If every allowed method fails (rare; typically caused by repo settings drift between approval and merge), the apply is **not** treated as a failure — infrastructure has already been changed. Approvals stay valid; a sticky `<!-- devops-agent-merge-failed -->` comment is posted asking the operator to merge manually.
+5. If the repo allows zero merge methods, the workflow exits with a hard error before retrying — that's a misconfiguration, not a transient failure.
+
+This makes the agent work uniformly across `devshop-infra` (rebase-only today), service repos provisioned by the `github-repo` Terraform module (`merge` + `rebase` allowed), and any future portco repo that wants squash.
 
 ### `devops-agent-postmortem.yml` — inputs
 

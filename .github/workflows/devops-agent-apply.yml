@@ -2,8 +2,9 @@ name: gravity-devops-agent — apply
 
 # Reusable workflow: applies the saved plans for a set of stacks in
 # Terragrunt-dependency-graph topological order. On success, enables
-# auto-squash-merge on the PR with a structured trailer block. On failure,
-# dispatches the postmortem workflow.
+# auto-merge on the PR using a configurable strategy priority
+# (default: squash > rebase > merge), with a structured trailer block.
+# On failure, dispatches the postmortem workflow.
 #
 # v0 (CI-bound) implementation. v1 maps to DevOpsBridge.run_apply_task() in
 # src/gravity_agent/bridges/devops/.
@@ -65,10 +66,24 @@ on:
         type: boolean
         default: false
       auto-merge:
-        description: "When true (default), enables auto-squash-merge on the PR after a successful apply."
+        description: "When true (default), enables auto-merge on the PR after a successful apply. Method is selected from the merge-strategy priority list."
         required: false
         type: boolean
         default: true
+      merge-strategy:
+        description: |
+          Merge strategy preference. Empty (default) means use the default priority
+          `squash > rebase > merge`. Explicit values: 'squash' | 'rebase' | 'merge'
+          select that method as highest priority. The agent walks the priority list
+          and picks the first method allowed by the repo. If a method is rejected
+          by GitHub at apply time (e.g. the repo silently disabled it after this
+          run started), the agent retries with the next-priority method.
+
+          Resolution order: this input > vars.DEVOPS_AGENT_MERGE_STRATEGY > default
+          priority `squash > rebase > merge`.
+        required: false
+        type: string
+        default: ""
       runs-on:
         description: "Runner label."
         required: false
@@ -516,7 +531,7 @@ jobs:
               await github.rest.issues.createComment({ owner, repo, issue_number, body });
             }
 
-      - name: Enable auto-squash-merge on success
+      - name: Enable auto-merge on success
         if: ${{ inputs.auto-merge && steps.summarize.outputs.outcome == 'success' }}
         env:
           PR_NUMBER: ${{ inputs.pr-number }}
@@ -525,9 +540,13 @@ jobs:
           APPROVER_LOGIN: ${{ inputs.approver-login }}
           GH_TOKEN: ${{ github.token }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          INPUT_MERGE_STRATEGY: ${{ inputs.merge-strategy }}
+          VAR_MERGE_STRATEGY: ${{ vars.DEVOPS_AGENT_MERGE_STRATEGY }}
         run: |
           set -euo pipefail
-          # Build a structured trailer block recorded in the squash commit.
+
+          # Build the structured trailer block recorded on the merge commit
+          # (squash) or last commit (rebase) or merge commit (merge).
           APPLIED_LINES=$(echo "$APPLIED_JSON" | jq -r '.[]')
           APPLIED_LIST="${APPLIED_LINES//$'\n'/$'\n'  - }"
           APPLIED_LIST="  - ${APPLIED_LIST}"
@@ -539,14 +558,153 @@ jobs:
           $APPLIED_LIST
           EOF
           )
-          # `gh pr merge --auto` enables auto-merge; GitHub completes the
-          # merge once required checks/reviews pass. We pass the body as the
-          # squash commit message body.
-          gh pr merge "$PR_NUMBER" \
-            --repo "$REPO" \
-            --auto \
-            --squash \
-            --body "$BODY"
+
+          # ----------------------------------------------------------------
+          # Resolve which merge methods are allowed by the repo.
+          # ----------------------------------------------------------------
+          # GitHub returns `allow_squash_merge`, `allow_rebase_merge`,
+          # `allow_merge_commit` on the repo object. The agent walks the
+          # priority list and picks the first method allowed.
+          REPO_INFO=$(gh api "repos/$REPO" --jq '{squash: .allow_squash_merge, rebase: .allow_rebase_merge, merge: .allow_merge_commit}')
+          ALLOW_SQUASH=$(echo "$REPO_INFO" | jq -r '.squash')
+          ALLOW_REBASE=$(echo "$REPO_INFO" | jq -r '.rebase')
+          ALLOW_MERGE=$(echo "$REPO_INFO" | jq -r '.merge')
+          echo "Repo merge methods: squash=$ALLOW_SQUASH rebase=$ALLOW_REBASE merge=$ALLOW_MERGE"
+
+          # ----------------------------------------------------------------
+          # Build the priority list.
+          # ----------------------------------------------------------------
+          # Resolution order: workflow input > repo var > default.
+          # Default priority: squash > rebase > merge.
+          # An explicit choice (input or var) puts that method first; the
+          # remaining methods follow in default order so we still have
+          # fallbacks if the chosen method is rejected at apply time.
+          STRATEGY="${INPUT_MERGE_STRATEGY:-${VAR_MERGE_STRATEGY:-}}"
+
+          case "$STRATEGY" in
+            squash) PRIORITY=("squash" "rebase" "merge") ;;
+            rebase) PRIORITY=("rebase" "squash" "merge") ;;
+            merge)  PRIORITY=("merge" "squash" "rebase") ;;
+            "")     PRIORITY=("squash" "rebase" "merge") ;;
+            *)
+              echo "::error::Invalid merge-strategy '$STRATEGY'. Must be one of: squash, rebase, merge, or empty for default."
+              exit 1
+              ;;
+          esac
+
+          # Filter the priority list to methods the repo actually allows.
+          ATTEMPT_LIST=()
+          for method in "${PRIORITY[@]}"; do
+            case "$method" in
+              squash) [ "$ALLOW_SQUASH" = "true" ] && ATTEMPT_LIST+=("squash") ;;
+              rebase) [ "$ALLOW_REBASE" = "true" ] && ATTEMPT_LIST+=("rebase") ;;
+              merge)  [ "$ALLOW_MERGE"  = "true" ] && ATTEMPT_LIST+=("merge")  ;;
+            esac
+          done
+
+          if [ "${#ATTEMPT_LIST[@]}" -eq 0 ]; then
+            echo "::error::No merge methods allowed on $REPO. The agent cannot auto-merge. Enable at least one of squash/rebase/merge in repo settings."
+            exit 1
+          fi
+
+          echo "Auto-merge attempt order: ${ATTEMPT_LIST[*]}"
+          if [ -n "$STRATEGY" ]; then
+            echo "  (preferred='$STRATEGY' — workflow input or DEVOPS_AGENT_MERGE_STRATEGY repo var)"
+          fi
+
+          # ----------------------------------------------------------------
+          # Walk the priority list, retrying with the next method on each
+          # failure. Apply has already succeeded; we are committing the PR
+          # to main, so we should not give up on auto-merge until every
+          # allowed method has been tried.
+          # ----------------------------------------------------------------
+          MERGE_OK=false
+          MERGE_METHOD=""
+          MERGE_ERROR=""
+          for method in "${ATTEMPT_LIST[@]}"; do
+            echo "Attempting auto-merge with method=$method ..."
+            # `gh pr merge --auto` enables auto-merge; GitHub completes the
+            # merge once required checks/reviews pass.
+            if OUTPUT=$(gh pr merge "$PR_NUMBER" \
+                --repo "$REPO" \
+                --auto \
+                "--$method" \
+                --body "$BODY" 2>&1); then
+              MERGE_OK=true
+              MERGE_METHOD="$method"
+              echo "Auto-merge enabled via $method."
+              break
+            else
+              MERGE_ERROR="$OUTPUT"
+              echo "::warning::Auto-merge with method=$method failed: $OUTPUT"
+            fi
+          done
+
+          {
+            echo "merge_ok=$MERGE_OK"
+            echo "merge_method=$MERGE_METHOD"
+            echo "merge_error<<EOF"
+            echo "$MERGE_ERROR"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+          if [ "$MERGE_OK" != "true" ]; then
+            # Apply has already succeeded — infra is changed. We do NOT
+            # treat this as an apply failure (no postmortem dispatch, no
+            # approval dismissal) because the PR is approved and the
+            # change is live. Post a comment so the operator can manually
+            # complete the merge.
+            echo "::warning title=auto-merge failed::Apply succeeded; PR is approved and ready to merge but auto-merge could not engage. See PR comment for details."
+          fi
+        id: merge
+
+      - name: Comment auto-merge failure on PR
+        if: ${{ inputs.auto-merge && steps.summarize.outputs.outcome == 'success' && steps.merge.outputs.merge_ok != 'true' }}
+        uses: actions/github-script@v7
+        env:
+          PR_NUMBER: ${{ inputs.pr-number }}
+          MERGE_ERROR: ${{ steps.merge.outputs.merge_error }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        with:
+          script: |
+            const marker = `<!-- devops-agent-merge-failed -->`;
+            const body = [
+              marker,
+              `### gravity-devops-agent — Auto-merge could not engage ⚠️`,
+              '',
+              `**Apply succeeded** — infrastructure is changed and reflects the reviewed plan. Approvals on this PR remain valid.`,
+              '',
+              `Auto-merge failed for every allowed method on this repo. Likely causes:`,
+              '',
+              `- The repo has no merge methods enabled (enable at least one of squash / rebase / merge in repo settings).`,
+              `- The repo silently disabled the configured method between approval and merge.`,
+              `- Branch protection requires a check that has not yet completed.`,
+              '',
+              `**Action:** merge this PR manually using whichever method your repo allows. The change is already applied; merging just records the PR in \`main\`. Then close out this notice.`,
+              '',
+              `<details><summary>Last error</summary>`,
+              '',
+              '```',
+              process.env.MERGE_ERROR || '(no error captured)',
+              '```',
+              '',
+              `</details>`,
+              '',
+              `[Workflow run](${process.env.RUN_URL})`,
+            ].join('\n');
+
+            const issue_number = parseInt(process.env.PR_NUMBER, 10);
+            const { owner, repo } = context.repo;
+            const { data: comments } = await github.rest.issues.listComments({
+              owner, repo, issue_number, per_page: 100,
+            });
+            const existing = comments.find(c => c.body && c.body.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number, body });
+            }
+
 
       - name: Dispatch postmortem on failure
         if: ${{ steps.summarize.outputs.outcome == 'failure' }}
