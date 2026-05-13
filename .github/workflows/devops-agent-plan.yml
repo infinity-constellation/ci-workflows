@@ -264,7 +264,18 @@ jobs:
           fi
 
           # Render JSON for Conftest and the summary.
-          terraform show -json "$RUNNER_TEMP/plan/plan.bin" > "$RUNNER_TEMP/plan/plan.json"
+          # IMPORTANT: For terragrunt, the providers are cached inside
+          # `.terragrunt-cache/<hash>/<module>/.terraform/providers/`, NOT in
+          # the stack's own `.terraform/`. Calling `terraform show -json`
+          # from the stack working directory fails with "missing or
+          # corrupted provider plugins". Use `terragrunt show -json` so
+          # Terragrunt delegates to terraform inside the cache directory
+          # where providers are actually present.
+          if [ "$ENGINE" = "terragrunt" ]; then
+            terragrunt show --non-interactive -json "$RUNNER_TEMP/plan/plan.bin" > "$RUNNER_TEMP/plan/plan.json"
+          else
+            terraform show -json "$RUNNER_TEMP/plan/plan.bin" > "$RUNNER_TEMP/plan/plan.json"
+          fi
 
           # Record metadata so the apply workflow validates engine match.
           jq -n \
