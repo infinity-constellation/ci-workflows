@@ -153,14 +153,31 @@ jobs:
 
           # Plan-artifact name is the contract the apply workflow consumes.
           # Keyed on stack-id + caller run-id + attempt so it's stable per
-          # CI run.
+          # CI run. NOTE: caller lookups use `startswith("devops-agent-plan-${stack_id}-")`
+          # so this MUST keep the full stack_id; do not truncate.
           PLAN_ARTIFACT="devops-agent-plan-${STACK_ID}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+
+          # AWS roleSessionName has a hard 64-char limit (alphanumeric +
+          # `+=,.@-_`). For deep stack paths (e.g.
+          # `live-infinity-aws-shared-infrastructure-us-east-2-shared-infra-baseline`,
+          # 71 chars) the previous template `devops-agent-plan-${STACK_ID}-${RUN_ID}`
+          # exceeded the limit and AssumeRoleWithWebIdentity failed. Truncate
+          # the stack-id to its tail (most-distinguishing portion) so the
+          # session name always fits. Budget:
+          #   64 - len("devops-agent-plan-") - len("-") - len(run-id, max 12)
+          #   = 64 - 18 - 1 - 12 = 33 chars for the stack tail.
+          # Bash `${VAR: -N}` returns the last N chars (or full string if shorter).
+          SESSION_TAIL="${STACK_ID: -33}"
+          ROLE_SESSION_NAME="devops-agent-plan-${SESSION_TAIL}-${GITHUB_RUN_ID}"
+          # Final safety: hard-truncate to 64 chars in case run-id is unexpectedly long.
+          ROLE_SESSION_NAME="${ROLE_SESSION_NAME:0:64}"
 
           {
             echo "stack_id=$STACK_ID"
             echo "aws_region=$AWS_REGION"
             echo "aws_role_to_assume=$AWS_ROLE_TO_ASSUME"
             echo "plan_artifact=$PLAN_ARTIFACT"
+            echo "role_session_name=$ROLE_SESSION_NAME"
             echo "bootstrap=$BOOTSTRAP"
           } >> "$GITHUB_OUTPUT"
 
@@ -215,7 +232,7 @@ jobs:
         with:
           role-to-assume: ${{ steps.resolve.outputs.aws_role_to_assume }}
           aws-region: ${{ steps.resolve.outputs.aws_region }}
-          role-session-name: devops-agent-plan-${{ steps.resolve.outputs.stack_id }}-${{ github.run_id }}
+          role-session-name: ${{ steps.resolve.outputs.role_session_name }}
 
       - name: Init
         if: steps.resolve.outputs.bootstrap != 'true'
