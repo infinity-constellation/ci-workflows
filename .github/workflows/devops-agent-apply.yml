@@ -41,15 +41,15 @@ on:
         required: true
         type: string
       terraform-version:
-        description: "Terraform version. Should match the plan workflow."
+        description: "Terraform version. Defaults to the canonical version in setup-iac-tools. Override only for testing upgrades."
         required: false
         type: string
-        default: "1.15.2"
+        default: ""
       terragrunt-version:
-        description: "Terragrunt version. Should match the plan workflow."
+        description: "Terragrunt version. Defaults to the canonical version in setup-iac-tools. Override only for testing upgrades."
         required: false
         type: string
-        default: "0.99.5"
+        default: ""
       aws-role-to-assume:
         description: "ARN of the AWS role to assume via OIDC. Defaults to vars.AWS_TF_APPLY_ROLE_TO_ASSUME, then vars.AWS_TF_ROLE_TO_ASSUME."
         required: false
@@ -155,7 +155,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Checkout PR head
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{ inputs.head-sha }}
           fetch-depth: 1
@@ -175,29 +175,14 @@ jobs:
           fi
           echo "Confirmed apply against authorized head $EXPECTED_SHA"
 
-      - name: Set up Terraform
-        uses: hashicorp/setup-terraform@v3
+      - name: Set up IaC tools
+        uses: infinity-constellation/ci-workflows/.github/actions/setup-iac-tools@main
         with:
-          terraform_version: ${{ inputs.terraform-version }}
-          terraform_wrapper: false
-
-      - name: Set up Terragrunt
-        env:
-          TG_VERSION: ${{ inputs.terragrunt-version }}
-          STACKS_JSON: ${{ inputs.stacks }}
-        run: |
-          set -euo pipefail
-          # Install Terragrunt if any stack uses it.
-          NEEDS_TG=$(echo "$STACKS_JSON" | jq -r 'any(.engine == "terragrunt")')
-          if [ "$NEEDS_TG" = "true" ]; then
-            curl -fsSL "https://github.com/gruntwork-io/terragrunt/releases/download/v${TG_VERSION}/terragrunt_linux_amd64" \
-              -o /usr/local/bin/terragrunt
-            chmod +x /usr/local/bin/terragrunt
-            terragrunt --version
-          fi
+          terraform-version: ${{ inputs.terraform-version }}
+          terragrunt-version: ${{ inputs.terragrunt-version }}
 
       - name: Configure AWS (OIDC)
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@v6
         with:
           role-to-assume: ${{ steps.resolve.outputs.aws_role_to_assume }}
           aws-region: ${{ steps.resolve.outputs.aws_region }}
@@ -484,7 +469,7 @@ jobs:
 
       - name: Comment apply outcome on PR
         if: ${{ always() }}
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         env:
           OUTCOME: ${{ steps.summarize.outputs.outcome }}
           APPLIED_JSON: ${{ steps.summarize.outputs.applied_stacks }}
@@ -675,7 +660,7 @@ jobs:
 
       - name: Comment auto-merge failure on PR
         if: ${{ inputs.auto-merge && steps.summarize.outputs.outcome == 'success' && steps.merge.outputs.merge_ok != 'true' }}
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         env:
           PR_NUMBER: ${{ inputs.pr-number }}
           MERGE_ERROR: ${{ steps.merge.outputs.merge_error }}

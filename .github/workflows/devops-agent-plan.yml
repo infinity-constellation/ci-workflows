@@ -35,15 +35,15 @@ on:
         type: string
         default: ""
       terraform-version:
-        description: "Terraform version to install."
+        description: "Terraform version to install. Defaults to the canonical version in setup-iac-tools. Override only for testing upgrades."
         required: false
         type: string
-        default: "1.15.2"
+        default: ""
       terragrunt-version:
-        description: "Terragrunt version to install. Used only when terragrunt.hcl is detected."
+        description: "Terragrunt version to install. Defaults to the canonical version in setup-iac-tools. Override only for testing upgrades."
         required: false
         type: string
-        default: "0.99.5"
+        default: ""
       aws-role-to-assume:
         description: "ARN of the AWS role to assume via OIDC. Defaults to vars.AWS_TF_ROLE_TO_ASSUME."
         required: false
@@ -107,7 +107,7 @@ jobs:
       bootstrap: ${{ steps.resolve.outputs.bootstrap }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Resolve configuration
         id: resolve
@@ -198,23 +198,12 @@ jobs:
           echo "engine=$ENGINE" >> "$GITHUB_OUTPUT"
           echo "Detected engine: $ENGINE"
 
-      - name: Set up Terraform
+      - name: Set up IaC tools
         if: steps.resolve.outputs.bootstrap != 'true'
-        uses: hashicorp/setup-terraform@v3
+        uses: infinity-constellation/ci-workflows/.github/actions/setup-iac-tools@main
         with:
-          terraform_version: ${{ inputs.terraform-version }}
-          terraform_wrapper: false
-
-      - name: Set up Terragrunt
-        if: ${{ steps.resolve.outputs.bootstrap != 'true' && steps.detect.outputs.engine == 'terragrunt' }}
-        env:
-          TG_VERSION: ${{ inputs.terragrunt-version }}
-        run: |
-          set -euo pipefail
-          curl -fsSL "https://github.com/gruntwork-io/terragrunt/releases/download/v${TG_VERSION}/terragrunt_linux_amd64" \
-            -o /usr/local/bin/terragrunt
-          chmod +x /usr/local/bin/terragrunt
-          terragrunt --version
+          terraform-version: ${{ inputs.terraform-version }}
+          terragrunt-version: ${{ inputs.terragrunt-version }}
 
       - name: Set up Conftest
         if: ${{ steps.resolve.outputs.bootstrap != 'true' && inputs.policy-dir != '' }}
@@ -228,7 +217,7 @@ jobs:
 
       - name: Configure AWS (OIDC)
         if: steps.resolve.outputs.bootstrap != 'true'
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@v6
         with:
           role-to-assume: ${{ steps.resolve.outputs.aws_role_to_assume }}
           aws-region: ${{ steps.resolve.outputs.aws_region }}
@@ -388,7 +377,7 @@ jobs:
 
       - name: Upload plan artifact
         if: steps.resolve.outputs.bootstrap != 'true'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ steps.resolve.outputs.plan_artifact }}
           path: ${{ steps.plan.outputs.plan_dir }}
@@ -397,7 +386,7 @@ jobs:
 
       - name: Comment plan on PR
         if: ${{ steps.resolve.outputs.bootstrap != 'true' && github.event_name == 'pull_request' }}
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         env:
           PLAN_DIR: ${{ steps.plan.outputs.plan_dir }}
           STACK_ID: ${{ steps.resolve.outputs.stack_id }}
@@ -472,7 +461,7 @@ jobs:
 
       - name: Comment bootstrap notice on PR
         if: ${{ steps.resolve.outputs.bootstrap == 'true' && github.event_name == 'pull_request' }}
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         with:
           script: |
             // ONE bootstrap comment per repo (not per stack). The marker is

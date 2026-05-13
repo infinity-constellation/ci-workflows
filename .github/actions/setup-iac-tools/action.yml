@@ -1,0 +1,111 @@
+# =============================================================================
+# setup-iac-tools composite action
+#
+# Installs Terraform and Terragrunt at the canonical pinned versions used by
+# the gravity-devops-agent. This is the **single source of truth** for which
+# versions the agent uses:
+#
+#   - Bump `terraform-version.default` here → propagates to plan, apply, and
+#     every BU infra repo's lint CI that calls this action.
+#   - Bump `terragrunt-version.default` here → same.
+#
+# Callers that want to pin to a specific version (e.g. for testing an upgrade)
+# can pass `terraform-version` or `terragrunt-version` explicitly. The default
+# is always the canonical production version.
+#
+# Usage (in plan/apply workflows and BU lint CIs):
+#
+#   - uses: infinity-constellation/ci-workflows/.github/actions/setup-iac-tools@main
+#
+# Or pinned to test a version bump:
+#
+#   - uses: infinity-constellation/ci-workflows/.github/actions/setup-iac-tools@main
+#     with:
+#       terraform-version: "1.15.3"
+#       terragrunt-version: "1.0.4"
+# =============================================================================
+
+name: "setup-iac-tools"
+description: "Install Terraform and Terragrunt at the canonical versions used by the gravity-devops-agent."
+
+inputs:
+  terraform-version:
+    description: "Terraform version to install. Defaults to the canonical production version."
+    required: false
+    default: "1.15.3"
+
+  terragrunt-version:
+    description: "Terragrunt version to install. Defaults to the canonical production version."
+    required: false
+    default: "1.0.4"
+
+  install-terragrunt:
+    description: "Whether to install Terragrunt. Set to 'false' for raw-Terraform-only stacks."
+    required: false
+    default: "true"
+
+outputs:
+  terraform-version:
+    description: "The Terraform version that was installed."
+    value: ${{ steps.versions.outputs.terraform }}
+
+  terragrunt-version:
+    description: "The Terragrunt version that was installed (empty if install-terragrunt=false)."
+    value: ${{ steps.versions.outputs.terragrunt }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Resolve versions
+      id: resolve
+      shell: bash
+      env:
+        INPUT_TF: ${{ inputs.terraform-version }}
+        INPUT_TG: ${{ inputs.terragrunt-version }}
+        CANONICAL_TF: "1.15.3"
+        CANONICAL_TG: "1.0.4"
+      run: |
+        # Use the input version if non-empty, otherwise fall back to canonical.
+        TF="${INPUT_TF:-$CANONICAL_TF}"
+        TG="${INPUT_TG:-$CANONICAL_TG}"
+        echo "terraform=${TF}" >> "$GITHUB_OUTPUT"
+        echo "terragrunt=${TG}" >> "$GITHUB_OUTPUT"
+        echo "Using Terraform ${TF}, Terragrunt ${TG}"
+
+    - name: Install Terraform
+      uses: hashicorp/setup-terraform@v4
+      with:
+        terraform_version: ${{ steps.resolve.outputs.terraform }}
+        terraform_wrapper: false
+
+    - name: Install Terragrunt
+      if: ${{ inputs.install-terragrunt == 'true' }}
+      shell: bash
+      env:
+        TG_VERSION: ${{ steps.resolve.outputs.terragrunt }}
+      run: |
+        set -euo pipefail
+        curl -fsSL \
+          "https://github.com/gruntwork-io/terragrunt/releases/download/v${TG_VERSION}/terragrunt_linux_amd64" \
+          -o /usr/local/bin/terragrunt
+        chmod +x /usr/local/bin/terragrunt
+
+    - name: Print installed versions
+      id: versions
+      shell: bash
+      env:
+        INSTALL_TG: ${{ inputs.install-terragrunt }}
+      run: |
+        set -euo pipefail
+        TF_VER=$(terraform version -json | jq -r '.terraform_version')
+        echo "terraform=$TF_VER" >> "$GITHUB_OUTPUT"
+        echo "Terraform: ${TF_VER}"
+
+        if [ "$INSTALL_TG" = "true" ]; then
+          TG_VER=$(terragrunt --version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+          echo "terragrunt=$TG_VER" >> "$GITHUB_OUTPUT"
+          echo "Terragrunt: ${TG_VER}"
+        else
+          echo "terragrunt=" >> "$GITHUB_OUTPUT"
+          echo "Terragrunt: (not installed)"
+        fi
