@@ -112,7 +112,11 @@ jobs:
           AWS_ROLE_TO_ASSUME="${INPUT_AWS_ROLE_TO_ASSUME:-${VAR_AWS_TF_APPLY_ROLE:-${VAR_AWS_TF_ROLE:-}}}"
 
           if [ -z "$AWS_ROLE_TO_ASSUME" ]; then
-            echo "::error::Missing AWS role. Set input aws-role-to-assume or vars AWS_TF_APPLY_ROLE_TO_ASSUME / AWS_TF_ROLE_TO_ASSUME."
+            # Apply has no bootstrap-skip semantics: if we got here without a
+            # role, something is wrong (the plan workflow should have already
+            # exited in bootstrap mode and the approve workflow should not
+            # have dispatched apply). Surface clearly.
+            echo "::error::Missing AWS apply role. Set input aws-role-to-assume or vars AWS_TF_APPLY_ROLE_TO_ASSUME / AWS_TF_ROLE_TO_ASSUME. Note: if AWS_TF_ROLE_TO_ASSUME is also unset, the plan workflow runs in bootstrap mode and apply should not have been dispatched."
             exit 1
           fi
 

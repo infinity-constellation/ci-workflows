@@ -352,6 +352,23 @@ Plus a `CODEOWNERS` file with explicit ownership for every path that may
 be touched by a PR. Branch protection on `main` should require the
 `devops-agent / plan` check and a CODEOWNERS-required review.
 
+### Bootstrap mode
+
+When `AWS_TF_ROLE_TO_ASSUME` is unset (e.g. on a freshly initialized infra
+repo before `shared-infra-baseline` has been applied), `devops-agent-plan.yml`
+runs in **bootstrap mode**: every step after the role check is skipped,
+no IAM credentials are assumed, no cloud calls are made, and the workflow
+exits successfully (not as an error). One sticky `<!-- devops-agent-bootstrap -->`
+comment is posted on the PR explaining the state and how to set the role
+vars.
+
+This means adopting the agent on a new repo costs zero CI noise: open a
+PR, see the bootstrap notice, follow the linked setup steps, push again,
+plans start working.
+
+The output `bootstrap` (boolean string) is exposed so callers can react —
+e.g. skip dispatching the apply workflow when bootstrap is true.
+
 ### Caller skeleton
 
 A typical caller's `.github/workflows/infra.yml` (here using `devshop-infra`
