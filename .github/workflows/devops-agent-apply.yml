@@ -363,6 +363,25 @@ jobs:
           FAILED_STACK=""
           FAILED_LOG=""
 
+          # Engine-agnostic invoker. Routes the requested verb to the right
+          # binary with the right wrapper flags. See devops-agent-plan.yml
+          # for full rationale (in short: terragrunt-mode show/apply must
+          # delegate via terragrunt so the working directory is the cached
+          # module dir where `.terraform/providers/` lives). Exported so
+          # the per-stack `(cd "$DIR" ...)` subshells below inherit it.
+          tf() {
+            local verb="$1"; shift
+            if [ "$ENGINE" = "terragrunt" ]; then
+              terragrunt "$verb" --non-interactive "$@"
+            else
+              case "$verb" in
+                init) terraform init -input=false "$@" ;;
+                *)    terraform "$verb" "$@" ;;
+              esac
+            fi
+          }
+          export -f tf
+
           while IFS= read -r DIR; do
             [ -z "$DIR" ] && continue
             STACK=$(echo "$STACKS_JSON" | jq -c --arg d "$DIR" '.[] | select(.directory == $d)')
@@ -371,6 +390,10 @@ jobs:
             DESTROY=$(echo "$STACK" | jq -r '.destroy')
             PLAN_DIR="$RUNNER_TEMP/plans/$STACK_ID"
             LOG="$RUNNER_TEMP/apply-logs/$STACK_ID.log"
+
+            # Re-export ENGINE for the subshells below (each iteration may
+            # apply a stack with a different engine).
+            export ENGINE
 
             echo ""
             echo "============================================================"
@@ -381,22 +404,14 @@ jobs:
             # initialize fresh on this runner).
             (
               cd "$DIR"
-              if [ "$ENGINE" = "terragrunt" ]; then
-                terragrunt init --non-interactive -reconfigure
-              else
-                terraform init -reconfigure -input=false
-              fi
+              tf init -reconfigure
             )
 
             # Apply the saved plan. Fail fast on error and capture log.
             set +e
             (
               cd "$DIR"
-              if [ "$ENGINE" = "terragrunt" ]; then
-                terragrunt apply --non-interactive -input=false -no-color "$PLAN_DIR/plan.bin"
-              else
-                terraform apply -input=false -no-color "$PLAN_DIR/plan.bin"
-              fi
+              tf apply -input=false -no-color "$PLAN_DIR/plan.bin"
             ) 2>&1 | tee "$LOG"
             APPLY_EXIT=${PIPESTATUS[0]}
             set -e
