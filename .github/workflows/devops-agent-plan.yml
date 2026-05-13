@@ -451,7 +451,7 @@ jobs:
               `   \`\`\``,
               `3. Re-run this workflow.`,
               '',
-              `See [ADR-0009](https://github.com/infinity-constellation/devshop-infra/blob/main/AGENTS.md) for the full setup procedure. This notice will go away once the role var is set.`,
+              `Operational references: \`devshop-infra/AGENTS.md\` (\`## IaC orchestration via gravity-devops-agent\`) and \`infinity-constellation/ci-workflows/README.md\` (\`## gravity-devops-agent (v0): IaC orchestration\`). This notice will go away once the role var is set.`,
             ].join('\n');
 
             const { owner, repo } = context.repo;
