@@ -241,11 +241,28 @@ jobs:
           ENGINE: ${{ steps.detect.outputs.engine }}
         run: |
           set -euo pipefail
-          if [ "$ENGINE" = "terragrunt" ]; then
-            terragrunt init --non-interactive -reconfigure
-          else
-            terraform init -reconfigure -input=false
-          fi
+
+          # Engine-agnostic invoker. Routes the requested verb to the right
+          # binary with the right wrapper flags. Any command that needs
+          # provider resolution (init, plan, show, apply, validate) MUST go
+          # through this function — for terragrunt mode, `terragrunt show`
+          # delegates to terraform inside the cached module dir where
+          # `.terraform/providers/` lives, while `terraform show` invoked
+          # from the stack's own working directory has no providers cached.
+          # Same shape used in every step below and in devops-agent-apply.yml.
+          tf() {
+            local verb="$1"; shift
+            if [ "$ENGINE" = "terragrunt" ]; then
+              terragrunt "$verb" --non-interactive "$@"
+            else
+              case "$verb" in
+                init) terraform init -input=false "$@" ;;
+                *)    terraform "$verb" "$@" ;;
+              esac
+            fi
+          }
+
+          tf init -reconfigure
 
       - name: Plan
         id: plan
@@ -258,6 +275,19 @@ jobs:
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/plan"
 
+          # See Init step for the rationale behind this helper.
+          tf() {
+            local verb="$1"; shift
+            if [ "$ENGINE" = "terragrunt" ]; then
+              terragrunt "$verb" --non-interactive "$@"
+            else
+              case "$verb" in
+                init) terraform init -input=false "$@" ;;
+                *)    terraform "$verb" "$@" ;;
+              esac
+            fi
+          }
+
           PLAN_ARGS=(-no-color -input=false -lock-timeout=10m -out="$RUNNER_TEMP/plan/plan.bin")
           if [ "$DESTROY" = "true" ]; then
             PLAN_ARGS+=(-destroy)
@@ -265,13 +295,8 @@ jobs:
 
           # detailed-exitcode: 0=no diff, 1=error, 2=diff. Treat 1 as failure.
           set +e
-          if [ "$ENGINE" = "terragrunt" ]; then
-            terragrunt plan --non-interactive -detailed-exitcode "${PLAN_ARGS[@]}" \
-              2>&1 | tee "$RUNNER_TEMP/plan/plan.txt"
-          else
-            terraform plan -detailed-exitcode "${PLAN_ARGS[@]}" \
-              2>&1 | tee "$RUNNER_TEMP/plan/plan.txt"
-          fi
+          tf plan -detailed-exitcode "${PLAN_ARGS[@]}" \
+            2>&1 | tee "$RUNNER_TEMP/plan/plan.txt"
           PLAN_EXIT=${PIPESTATUS[0]}
           set -e
 
@@ -280,8 +305,10 @@ jobs:
             exit 1
           fi
 
-          # Render JSON for Conftest and the summary.
-          terraform show -json "$RUNNER_TEMP/plan/plan.bin" > "$RUNNER_TEMP/plan/plan.json"
+          # Render JSON for Conftest and the summary. MUST go through tf()
+          # so that in terragrunt mode the show runs inside the cached
+          # module dir (with providers) rather than the stack working dir.
+          tf show -json "$RUNNER_TEMP/plan/plan.bin" > "$RUNNER_TEMP/plan/plan.json"
 
           # Record metadata so the apply workflow validates engine match.
           jq -n \
