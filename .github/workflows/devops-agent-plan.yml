@@ -87,6 +87,9 @@ on:
       has-changes:
         description: "true if the plan reports any resource changes."
         value: ${{ jobs.plan.outputs.has-changes }}
+      bootstrap:
+        description: "true when AWS_TF_ROLE_TO_ASSUME is unset and the workflow ran in bootstrap mode (no plan was performed)."
+        value: ${{ jobs.plan.outputs.bootstrap }}
 
 permissions:
   contents: read
@@ -101,6 +104,7 @@ jobs:
       stack-id: ${{ steps.resolve.outputs.stack_id }}
       engine: ${{ steps.detect.outputs.engine }}
       has-changes: ${{ steps.summarize.outputs.has_changes }}
+      bootstrap: ${{ steps.resolve.outputs.bootstrap }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -134,9 +138,17 @@ jobs:
           AWS_REGION="${INPUT_AWS_REGION:-${VAR_AWS_REGION:-us-east-2}}"
           AWS_ROLE_TO_ASSUME="${INPUT_AWS_ROLE_TO_ASSUME:-${VAR_AWS_TF_ROLE_TO_ASSUME:-}}"
 
+          # Bootstrap mode: when the AWS role isn't configured, we're either
+          # (a) on a freshly initialized infra repo before shared-infra-baseline
+          # has been applied, or (b) on an existing repo whose
+          # AWS_TF_ROLE_TO_ASSUME repo var was never set. In both cases we
+          # emit a clear notice and exit cleanly rather than failing every PR
+          # with a wall of red. The intent: the agent is self-bootstrapping —
+          # adopting it on a new repo costs zero CI noise.
+          BOOTSTRAP=false
           if [ -z "$AWS_ROLE_TO_ASSUME" ]; then
-            echo "::error::Missing AWS role. Set input aws-role-to-assume or repo var AWS_TF_ROLE_TO_ASSUME."
-            exit 1
+            BOOTSTRAP=true
+            echo "::notice title=gravity-devops-agent (bootstrap mode)::AWS_TF_ROLE_TO_ASSUME is not configured for this repo. Skipping plan for $STACK_ID. Set the repo variable to enable plans. See gravity-devops-agent docs for setup."
           fi
 
           # Plan-artifact name is the contract the apply workflow consumes.
@@ -149,10 +161,12 @@ jobs:
             echo "aws_region=$AWS_REGION"
             echo "aws_role_to_assume=$AWS_ROLE_TO_ASSUME"
             echo "plan_artifact=$PLAN_ARTIFACT"
+            echo "bootstrap=$BOOTSTRAP"
           } >> "$GITHUB_OUTPUT"
 
       - name: Detect engine
         id: detect
+        if: steps.resolve.outputs.bootstrap != 'true'
         working-directory: ${{ inputs.working-directory }}
         run: |
           set -euo pipefail
@@ -168,13 +182,14 @@ jobs:
           echo "Detected engine: $ENGINE"
 
       - name: Set up Terraform
+        if: steps.resolve.outputs.bootstrap != 'true'
         uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: ${{ inputs.terraform-version }}
           terraform_wrapper: false
 
       - name: Set up Terragrunt
-        if: ${{ steps.detect.outputs.engine == 'terragrunt' }}
+        if: ${{ steps.resolve.outputs.bootstrap != 'true' && steps.detect.outputs.engine == 'terragrunt' }}
         env:
           TG_VERSION: ${{ inputs.terragrunt-version }}
         run: |
@@ -185,7 +200,7 @@ jobs:
           terragrunt --version
 
       - name: Set up Conftest
-        if: ${{ inputs.policy-dir != '' }}
+        if: ${{ steps.resolve.outputs.bootstrap != 'true' && inputs.policy-dir != '' }}
         env:
           CONFTEST_VERSION: ${{ inputs.conftest-version }}
         run: |
@@ -195,6 +210,7 @@ jobs:
           conftest --version
 
       - name: Configure AWS (OIDC)
+        if: steps.resolve.outputs.bootstrap != 'true'
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ steps.resolve.outputs.aws_role_to_assume }}
@@ -202,6 +218,7 @@ jobs:
           role-session-name: devops-agent-plan-${{ steps.resolve.outputs.stack_id }}-${{ github.run_id }}
 
       - name: Init
+        if: steps.resolve.outputs.bootstrap != 'true'
         working-directory: ${{ inputs.working-directory }}
         env:
           ENGINE: ${{ steps.detect.outputs.engine }}
@@ -215,6 +232,7 @@ jobs:
 
       - name: Plan
         id: plan
+        if: steps.resolve.outputs.bootstrap != 'true'
         working-directory: ${{ inputs.working-directory }}
         env:
           ENGINE: ${{ steps.detect.outputs.engine }}
@@ -264,7 +282,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Conftest gate
-        if: ${{ inputs.policy-dir != '' }}
+        if: ${{ steps.resolve.outputs.bootstrap != 'true' && inputs.policy-dir != '' }}
         env:
           POLICY_DIR: ${{ inputs.policy-dir }}
           PLAN_DIR: ${{ steps.plan.outputs.plan_dir }}
@@ -274,6 +292,7 @@ jobs:
 
       - name: Summarize plan
         id: summarize
+        if: steps.resolve.outputs.bootstrap != 'true'
         env:
           PLAN_DIR: ${{ steps.plan.outputs.plan_dir }}
           PLAN_EXIT: ${{ steps.plan.outputs.plan_exit }}
@@ -324,6 +343,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload plan artifact
+        if: steps.resolve.outputs.bootstrap != 'true'
         uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.resolve.outputs.plan_artifact }}
@@ -332,7 +352,7 @@ jobs:
           if-no-files-found: error
 
       - name: Comment plan on PR
-        if: ${{ github.event_name == 'pull_request' }}
+        if: ${{ steps.resolve.outputs.bootstrap != 'true' && github.event_name == 'pull_request' }}
         uses: actions/github-script@v7
         env:
           PLAN_DIR: ${{ steps.plan.outputs.plan_dir }}
@@ -403,5 +423,51 @@ jobs:
             } else {
               await github.rest.issues.createComment({
                 owner, repo, issue_number, body: header,
+              });
+            }
+
+      - name: Comment bootstrap notice on PR
+        if: ${{ steps.resolve.outputs.bootstrap == 'true' && github.event_name == 'pull_request' }}
+        uses: actions/github-script@v7
+        with:
+          script: |
+            // ONE bootstrap comment per repo (not per stack). The marker is
+            // intentionally not stack-scoped so a multi-stack PR doesn't post
+            // N identical notices.
+            const marker = `<!-- devops-agent-bootstrap -->`;
+            const body = [
+              marker,
+              `### gravity-devops-agent — Bootstrap mode`,
+              '',
+              `This repo does not yet have \`AWS_TF_ROLE_TO_ASSUME\` configured, so the agent is running in **bootstrap mode**: plan and apply are skipped, no IAM credentials are assumed, no cloud calls are made.`,
+              '',
+              `**To enable plans + applies:**`,
+              '',
+              `1. Apply \`shared-infra-baseline\` for this BU (provisions the \`github-actions-tf-plan\` and \`github-actions-tf-apply\` IAM roles).`,
+              `2. Set the role ARNs as repo variables:`,
+              `   \`\`\`bash`,
+              `   gh variable set AWS_TF_ROLE_TO_ASSUME --repo <org>/<repo> --body "<tf_plan_role_arn>"`,
+              `   gh variable set AWS_TF_APPLY_ROLE_TO_ASSUME --repo <org>/<repo> --body "<tf_apply_role_arn>"`,
+              `   \`\`\``,
+              `3. Re-run this workflow.`,
+              '',
+              `See [ADR-0009](https://github.com/infinity-constellation/devshop-infra/blob/main/AGENTS.md) for the full setup procedure. This notice will go away once the role var is set.`,
+            ].join('\n');
+
+            const { owner, repo } = context.repo;
+            const issue_number = context.payload.pull_request.number;
+            const { data: comments } = await github.rest.issues.listComments({
+              owner, repo, issue_number, per_page: 100,
+            });
+            const existing = comments.find(c =>
+              c.user && c.user.type === 'Bot' && c.body && c.body.includes(marker)
+            );
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner, repo, comment_id: existing.id, body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner, repo, issue_number, body,
               });
             }
