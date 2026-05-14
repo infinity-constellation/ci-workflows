@@ -192,9 +192,8 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Use diagnosis as primary (comment-question answer), fall back to
-          # details then summary if the LLM put the answer in a different field.
-          RESPONSE="${LLM_DIAGNOSIS:-${LLM_DETAILS:-${LLM_SUMMARY:-}}}"
+          # comment-question answers go in 'details'. Fall back to summary then diagnosis.
+          RESPONSE="${LLM_DETAILS:-${LLM_SUMMARY:-${LLM_DIAGNOSIS:-}}}"
           if [ -n "$LLM_FIX" ]; then
             RESPONSE="${RESPONSE}"$'\n\n'"${LLM_FIX}"
           fi
