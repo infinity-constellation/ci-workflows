@@ -1,0 +1,241 @@
+name: LLM comment enrichment
+description: |
+  Calls OpenRouter to produce enriched comment content for gravity-devops-agent
+  PR comments. Returns structured markdown sections that callers inject into
+  comments. Always fails open — on any error, outputs are empty strings and
+  the caller falls back to static content.
+
+inputs:
+  event-type:
+    description: |
+      One of: plan | apply-success | apply-failure | ineligible-approval | apply-queued
+    required: true
+  context-json:
+    description: |
+      JSON object with all relevant context for the event. Shape varies by
+      event-type — see the system prompt in the action body for each schema.
+    required: true
+  openrouter-api-key:
+    description: "OpenRouter API key."
+    required: true
+  model:
+    description: "OpenRouter model ID."
+    required: false
+    default: "anthropic/claude-haiku-3.5"
+
+outputs:
+  display-name:
+    description: "Short human-readable name for the primary stack(s)."
+    value: ${{ steps.call.outputs.display_name }}
+  summary:
+    description: "Markdown prose summary of the event."
+    value: ${{ steps.call.outputs.summary }}
+  cta:
+    description: "Call-to-action for the reviewer/operator."
+    value: ${{ steps.call.outputs.cta }}
+  diagnosis:
+    description: "Root cause diagnosis (postmortem / apply-failure only)."
+    value: ${{ steps.call.outputs.diagnosis }}
+  fix:
+    description: "Concrete remediation steps (postmortem / apply-failure only)."
+    value: ${{ steps.call.outputs.fix }}
+
+runs:
+  using: composite
+  steps:
+    - name: Call OpenRouter
+      id: call
+      continue-on-error: true
+      shell: bash
+      env:
+        EVENT_TYPE: ${{ inputs.event-type }}
+        CONTEXT_JSON: ${{ inputs.context-json }}
+        OPENROUTER_API_KEY: ${{ inputs.openrouter-api-key }}
+        MODEL: ${{ inputs.model }}
+      run: |
+        set -euo pipefail
+
+        # ── System prompt ────────────────────────────────────────────────────
+        # Shared preamble that sets the model's role and output contract.
+        SYSTEM_PROMPT='You are Gravity'"'"'s DevOps Agent — an automated infrastructure
+        operations agent built by Infinity Constellation for the Gravity platform.
+        You operate within GitHub Pull Requests, reviewing Terraform/Terragrunt
+        infrastructure changes and guiding engineers through the plan → approve
+        → apply lifecycle.
+
+        Your voice is direct, technically precise, and helpful. You speak as a
+        senior infrastructure engineer who deeply understands the codebase. You
+        are not a generic assistant — you are embedded in Gravity'"'"'s infrastructure
+        workflows and your comments appear under the gravity-devops-agent identity.
+
+        You will be given a JSON context object describing an infrastructure
+        event. Produce a JSON response with these fields (all strings,
+        all markdown-formatted, no outer code fences):
+
+          display_name  — Short human-readable name for the primary stack(s).
+                          Strip path prefixes (live/, live/infinity/aws/, etc.),
+                          collapse region slugs (us-east-2 → drop it unless
+                          ambiguous), and use " · " as a separator.
+                          Examples: "ecr · infinity-factory-api",
+                                    "production · eks-cluster",
+                                    "staging · rds".
+
+          summary       — What happened and why it matters. Be specific about
+                          the actual resources involved. Write for a senior
+                          engineer who needs to decide whether to approve.
+                          Reference real resource types and names from the
+                          context. No filler phrases. Can be multiple paragraphs
+                          if the change is complex or high-risk.
+
+          cta           — A single clear call-to-action sentence telling the
+                          reader exactly what to do next. Start with a verb.
+                          Example: "Approve to create the ECR repository and
+                          lifecycle policy for infinity-factory/api."
+
+          diagnosis     — (apply-failure, postmortem, and comment-question events)
+                          Root cause of the failure or answer to the question,
+                          grounded in the provided context. Quote the key error
+                          line when diagnosing failures. Empty string for
+                          plan/apply-success/apply-queued events.
+
+          fix           — (apply-failure and postmortem events only) Concrete
+                          numbered remediation steps. Reference specific
+                          commands, file paths, or Terraform addresses where
+                          applicable. Empty string for other events.
+
+        Respond with ONLY the raw JSON object. No markdown wrapper, no
+        explanation outside the JSON.'
+
+        # ── Per-event user prompt ────────────────────────────────────────────
+        case "$EVENT_TYPE" in
+          plan)
+            USER_PROMPT="Infrastructure plan event. Context: $CONTEXT_JSON
+
+        Produce display_name, summary (explain what is being created/changed/
+        destroyed and any notable risk), and cta (tell the reviewer whether to
+        approve and what approving will do). diagnosis and fix should be empty."
+            ;;
+          apply-success)
+            USER_PROMPT="Infrastructure apply succeeded. Context: $CONTEXT_JSON
+
+        Produce display_name, summary (confirm what was applied and note any
+        follow-up actions the team should be aware of, e.g. new endpoints,
+        secrets rotation, DNS propagation), and cta (the PR is about to be
+        auto-merged — any final note). diagnosis and fix should be empty."
+            ;;
+          apply-failure)
+            USER_PROMPT="Infrastructure apply FAILED. Context: $CONTEXT_JSON
+
+        Produce display_name, summary (brief: what was attempted, what failed),
+        diagnosis (root cause from the error log — quote the key error line),
+        and fix (numbered remediation steps). cta should tell the author what
+        to do to get this unblocked."
+            ;;
+          ineligible-approval)
+            USER_PROMPT="A PR approval was received but the approver does not
+        have CODEOWNERS coverage for all affected paths. Context: $CONTEXT_JSON
+
+        Produce display_name (of the stacks involved), summary (explain in
+        plain English why the approval wasn't sufficient), and cta (tell the
+        author exactly who needs to approve and how to request it).
+        diagnosis and fix should be empty."
+            ;;
+          apply-queued)
+            USER_PROMPT="A valid CODEOWNER approval triggered an apply.
+        Context: $CONTEXT_JSON
+
+        Produce display_name (of the stacks being applied), summary (brief
+        confirmation of what is about to be applied and who approved it),
+        and cta (what will happen next — apply then auto-merge).
+        diagnosis and fix should be empty."
+            ;;
+          comment-question)
+            USER_PROMPT="An engineer has left a comment on the PR directed at
+        Gravity's DevOps Agent. Context: $CONTEXT_JSON
+
+        The context includes:
+        - 'question': what the engineer asked or said
+        - 'plan_context': relevant plan/stack information if available
+        - 'pr_context': PR title, branch, author
+
+        Produce:
+        - display_name: the stack or area being asked about (if identifiable)
+        - summary: empty string
+        - cta: empty string
+        - diagnosis: your direct, helpful answer to the question — grounded
+          in the provided context. If asked about a plan, reference the
+          actual resources. If asked about an error, diagnose it. If asked
+          how to do something, give a concrete answer. Write as Gravity's
+          DevOps Agent, not as a generic assistant.
+        - fix: any follow-up actions if relevant, otherwise empty string."
+            ;;
+          *)
+            echo "Unknown event type: $EVENT_TYPE" >&2
+            exit 1
+            ;;
+        esac
+
+        # ── Build request payload ────────────────────────────────────────────
+        PAYLOAD=$(jq -n \
+          --arg model "$MODEL" \
+          --arg system "$SYSTEM_PROMPT" \
+          --arg user "$USER_PROMPT" \
+          '{
+            model: $model,
+            messages: [
+              {role: "system", content: $system},
+              {role: "user",   content: $user}
+            ],
+            temperature: 0.3,
+            max_tokens: 1200,
+            response_format: {type: "json_object"}
+          }')
+
+        # ── Call OpenRouter ──────────────────────────────────────────────────
+        RESPONSE=$(curl -sf \
+          --max-time 20 \
+          -H "Authorization: Bearer $OPENROUTER_API_KEY" \
+          -H "Content-Type: application/json" \
+          -H "X-Title: gravity-devops-agent" \
+          -d "$PAYLOAD" \
+          https://openrouter.ai/api/v1/chat/completions)
+
+        # ── Parse response ───────────────────────────────────────────────────
+        RAW_CONTENT=$(echo "$RESPONSE" | jq -r '.choices[0].message.content // empty')
+        if [ -z "$RAW_CONTENT" ]; then
+          echo "::warning::LLM response was empty or malformed — falling back to static content"
+          echo "display_name=" >> "$GITHUB_OUTPUT"
+          echo "summary="      >> "$GITHUB_OUTPUT"
+          echo "cta="          >> "$GITHUB_OUTPUT"
+          echo "diagnosis="    >> "$GITHUB_OUTPUT"
+          echo "fix="          >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        # Extract each field, defaulting to empty string on missing keys.
+        extract() { echo "$RAW_CONTENT" | jq -r --arg k "$1" '.[$k] // ""'; }
+
+        DISPLAY_NAME=$(extract display_name)
+        SUMMARY=$(extract summary)
+        CTA=$(extract cta)
+        DIAGNOSIS=$(extract diagnosis)
+        FIX=$(extract fix)
+
+        # Write multi-line outputs using heredoc delimiter syntax.
+        {
+          echo "display_name<<__LLM_EOF__"
+          echo "$DISPLAY_NAME"
+          echo "__LLM_EOF__"
+          echo "summary<<__LLM_EOF__"
+          echo "$SUMMARY"
+          echo "__LLM_EOF__"
+          echo "cta<<__LLM_EOF__"
+          echo "$CTA"
+          echo "__LLM_EOF__"
+          echo "diagnosis<<__LLM_EOF__"
+          echo "$DIAGNOSIS"
+          echo "__LLM_EOF__"
+          echo "fix<<__LLM_EOF__"
+          echo "$FIX"
+          echo "__LLM_EOF__"
+        } >> "$GITHUB_OUTPUT"

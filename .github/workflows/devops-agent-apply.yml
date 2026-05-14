@@ -504,6 +504,23 @@ jobs:
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Enrich with LLM
+        id: llm
+        if: ${{ always() }}
+        uses: infinity-constellation/ci-workflows/.github/actions/llm-comment@main
+        with:
+          event-type: ${{ steps.summarize.outputs.outcome == 'success' && 'apply-success' || 'apply-failure' }}
+          openrouter-api-key: ${{ secrets.OPENROUTER_API_KEY }}
+          context-json: >-
+            {
+              "outcome": "${{ steps.summarize.outputs.outcome }}",
+              "applied_stacks": ${{ steps.summarize.outputs.applied_stacks || '[]' }},
+              "failed_stack": "${{ steps.summarize.outputs.failed_stack }}",
+              "approver": "${{ inputs.approver-login }}",
+              "pr_number": ${{ inputs.pr-number }},
+              "run_url": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            }
+
       - name: Comment apply outcome on PR
         if: ${{ always() }}
         uses: actions/github-script@v9
@@ -515,58 +532,65 @@ jobs:
           PR_NUMBER: ${{ inputs.pr-number }}
           APPROVER_LOGIN: ${{ inputs.approver-login }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          LLM_DISPLAY_NAME: ${{ steps.llm.outputs.display_name }}
+          LLM_SUMMARY: ${{ steps.llm.outputs.summary }}
+          LLM_CTA: ${{ steps.llm.outputs.cta }}
         with:
           github-token: ${{ steps.app-token.outputs.token }}
           script: |
-            const marker = `<!-- devops-agent-apply -->`;
-            const applied  = JSON.parse(process.env.APPLIED_JSON || '[]');
-            const stacks   = JSON.parse(process.env.STACKS_JSON  || '[]');
-            const failed   = process.env.FAILED_STACK;
-            const outcome  = process.env.OUTCOME;
-            const approver = process.env.APPROVER_LOGIN;
-            const runUrl   = process.env.RUN_URL;
-
-            // Derive short display IDs from full stack IDs (mirrors plan workflow logic)
-            function toDisplayId(id) {
-              return id
-                .replace(/^live-/, '')
-                .replace(/^(infinity|labrynth)-aws-/, '')
-                .replace(/-(us-east-[12]|us-west-2|eu-west-1)-/g, '-')
-                .replace(/-/, ' · ');
-            }
+            const marker      = `<!-- devops-agent-apply -->`;
+            const applied     = JSON.parse(process.env.APPLIED_JSON || '[]');
+            const stacks      = JSON.parse(process.env.STACKS_JSON  || '[]');
+            const failed      = process.env.FAILED_STACK;
+            const outcome     = process.env.OUTCOME;
+            const approver    = process.env.APPROVER_LOGIN;
+            const runUrl      = process.env.RUN_URL;
+            const llmDisplay  = process.env.LLM_DISPLAY_NAME;
+            const llmSummary  = process.env.LLM_SUMMARY  || '';
+            const llmCta      = process.env.LLM_CTA      || '';
 
             const skipped = stacks
               .map(s => s.stack_id)
               .filter(id => !applied.includes(id) && id !== failed);
 
+            // Display name: prefer LLM, fall back to last segment of stack_id
+            function fallbackDisplay(id) {
+              return (id || '').split('-').slice(-3).join('-') || id;
+            }
+            const primaryDisplay = llmDisplay || (outcome === 'success'
+              ? applied.map(fallbackDisplay).join(', ')
+              : fallbackDisplay(failed));
+
             const lines = [marker];
 
             if (outcome === 'success') {
-              lines.push(`#### Applied — ${applied.map(toDisplayId).join(', ')}`);
+              lines.push(`#### Applied — ${primaryDisplay}`);
               lines.push('');
               lines.push(`Approved by @${approver} · [run](${runUrl})`);
-              if (applied.length > 0) {
-                lines.push('');
-                lines.push(applied.map(s => `- ✅ \`${toDisplayId(s)}\``).join('\n'));
-              }
+              lines.push('');
+              lines.push(applied.map(s => `- ✅ \`${fallbackDisplay(s)}\``).join('\n'));
+              if (llmSummary) { lines.push('', llmSummary); }
+              if (llmCta)     { lines.push('', `> ${llmCta}`); }
             } else {
-              lines.push(`#### Apply failed — \`${toDisplayId(failed)}\``);
+              lines.push(`#### Apply failed — \`${primaryDisplay}\``);
               lines.push('');
               lines.push(`Approved by @${approver} · [run](${runUrl})`);
+              if (llmSummary) { lines.push('', llmSummary); }
               lines.push('');
               if (applied.length > 0) {
                 lines.push('**Applied before failure:**');
-                lines.push(applied.map(s => `- ✅ \`${toDisplayId(s)}\``).join('\n'));
+                lines.push(applied.map(s => `- ✅ \`${fallbackDisplay(s)}\``).join('\n'));
                 lines.push('');
               }
-              lines.push(`**Failed:** \`${toDisplayId(failed)}\``);
+              lines.push(`**Failed:** \`${fallbackDisplay(failed)}\``);
               if (skipped.length > 0) {
-                lines.push('');
-                lines.push('**Skipped (downstream of failure):**');
-                lines.push(skipped.map(s => `- ⏭️ \`${toDisplayId(s)}\``).join('\n'));
+                lines.push('', '**Skipped (downstream of failure):**');
+                lines.push(skipped.map(s => `- ⏭️ \`${fallbackDisplay(s)}\``).join('\n'));
               }
               lines.push('');
-              lines.push('> Approvals have been dismissed. A postmortem comment will follow.');
+              lines.push(llmCta
+                ? `> ${llmCta}`
+                : '> Approvals have been dismissed. A postmortem comment will follow.');
             }
 
             const body = lines.join('\n');

@@ -102,7 +102,7 @@ jobs:
     outputs:
       plan-artifact: ${{ steps.resolve.outputs.plan_artifact }}
       stack-id: ${{ steps.resolve.outputs.stack_id }}
-      display-id: ${{ steps.display.outputs.display_id }}
+      display-id: ${{ steps.llm.outputs.display_name }}
       engine: ${{ steps.detect.outputs.engine }}
       has-changes: ${{ steps.summarize.outputs.has_changes }}
       bootstrap: ${{ steps.resolve.outputs.bootstrap }}
@@ -193,39 +193,6 @@ jobs:
             echo "role_session_name=$ROLE_SESSION_NAME"
             echo "bootstrap=$BOOTSTRAP"
           } >> "$GITHUB_OUTPUT"
-
-      - name: Derive display ID
-        id: display
-        if: steps.resolve.outputs.bootstrap != 'true'
-        env:
-          STACK_ID: ${{ steps.resolve.outputs.stack_id }}
-        run: |
-          set -euo pipefail
-          # Produce a short human-readable display_id from the full stack_id.
-          # Rules (applied in order):
-          #   1. Strip leading "live-"
-          #   2. Collapse known region slugs to compact forms
-          #   3. Strip BU name prefix if it matches the repo owner (optional — best-effort)
-          #   4. Replace first "-aws-" separator with " · " to visually group provider
-          #   5. Remaining hyphens are preserved (resource names keep their dashes)
-          # Examples:
-          #   live-infinity-aws-ecr-infinity-factory-api  → ecr · infinity-factory-api
-          #   live-infinity-aws-production-us-east-2-eks-cluster → production · eks-cluster
-          #   live-labrynth-aws-staging-us-east-2-vpc     → staging · vpc
-          id="${STACK_ID#live-}"               # strip leading "live-"
-          id="${id#infinity-aws-}"             # strip "infinity-aws-"
-          id="${id#labrynth-aws-}"             # strip "labrynth-aws-"
-          id="${id//-us-east-2-/-}"            # collapse region slugs
-          id="${id//-us-east-1-/-}"
-          id="${id//-us-west-2-/-}"
-          id="${id//-eu-west-1-/-}"
-          # Insert visual separator before the resource name portion:
-          # if id contains exactly one remaining hyphen group that looks like
-          # "env-resource", split at first hyphen into "env · resource"
-          # We do this by replacing the FIRST hyphen with " · "
-          # but only when there's more than one segment.
-          DISPLAY=$(echo "$id" | sed 's/-/ · /')
-          echo "display_id=$DISPLAY" >> "$GITHUB_OUTPUT"
 
       - name: Detect engine
         id: detect
@@ -406,6 +373,25 @@ jobs:
             echo "replaces=$REPLACES"
           } >> "$GITHUB_OUTPUT"
 
+          # Resource names for LLM context — all resources being created, changed, or destroyed.
+          RESOURCE_NAMES=$(jq -c '[
+            .resource_changes[]?
+            | select(.change.actions | (index("create") or index("update") or index("delete")))
+            | {address: .address, type: .type, actions: .change.actions}
+          ] | .[:40]' "$PLAN_DIR/plan.json")
+          echo "resource_names=$RESOURCE_NAMES" >> "$GITHUB_OUTPUT"
+
+          # Plan excerpt for LLM — first 3000 chars of cleaned plan text (enough for context, cheap on tokens).
+          PLAN_EXCERPT=$(cat "$PLAN_DIR/plan.txt" \
+            | sed 's/^[0-9:]\{8,\}\.[0-9]* STDOUT terraform: //' \
+            | grep -v 'data\.[^ ]* .*: \(Reading\.\.\.\|Read complete after\|Still reading\.\.\.\)' \
+            | head -c 3000 || true)
+          {
+            echo "plan_excerpt<<__PLAN_EOF__"
+            echo "$PLAN_EXCERPT"
+            echo "__PLAN_EOF__"
+          } >> "$GITHUB_OUTPUT"
+
           # Step summary (Actions tab)
           {
             if [ "$DESTROY" = "true" ]; then
@@ -428,8 +414,27 @@ jobs:
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Upload plan artifact
+      - name: Enrich with LLM
+        id: llm
         if: steps.resolve.outputs.bootstrap != 'true'
+        uses: infinity-constellation/ci-workflows/.github/actions/llm-comment@main
+        with:
+          event-type: plan
+          openrouter-api-key: ${{ secrets.OPENROUTER_API_KEY }}
+          context-json: >-
+            {
+              "stack_id": "${{ steps.resolve.outputs.stack_id }}",
+              "engine": "${{ steps.detect.outputs.engine }}",
+              "adds": ${{ steps.summarize.outputs.adds }},
+              "changes": ${{ steps.summarize.outputs.changes }},
+              "destroys": ${{ steps.summarize.outputs.destroys }},
+              "replaces": ${{ steps.summarize.outputs.replaces }},
+              "is_destroy_mode": ${{ inputs.destroy }},
+              "resource_names": ${{ steps.summarize.outputs.resource_names || '[]' }},
+              "plan_excerpt": ${{ toJSON(steps.summarize.outputs.plan_excerpt) }}
+            }
+
+      - name: Upload plan artifact
         uses: actions/upload-artifact@v7
         with:
           name: ${{ steps.resolve.outputs.plan_artifact }}
@@ -443,8 +448,9 @@ jobs:
         env:
           PLAN_DIR: ${{ steps.plan.outputs.plan_dir }}
           STACK_ID: ${{ steps.resolve.outputs.stack_id }}
-          DISPLAY_ID: ${{ steps.display.outputs.display_id }}
-          ENGINE: ${{ steps.detect.outputs.engine }}
+          DISPLAY_ID: ${{ steps.llm.outputs.display_name || steps.resolve.outputs.stack_id }}
+          LLM_SUMMARY: ${{ steps.llm.outputs.summary }}
+          LLM_CTA: ${{ steps.llm.outputs.cta }}
           ADDS: ${{ steps.summarize.outputs.adds }}
           CHANGES: ${{ steps.summarize.outputs.changes }}
           DESTROYS: ${{ steps.summarize.outputs.destroys }}
@@ -459,12 +465,7 @@ jobs:
             const fs = require('fs');
             const path = require('path');
 
-            // ── Clean raw plan output ──────────────────────────────────────────
-            // Strip the "HH:MM:SS.NNN STDOUT terraform: " prefix that Terragrunt
-            // adds to every line, and remove noisy data-source read lines that
-            // aren't relevant to a reviewer (they confirm existing infra, not
-            // changes). Keep everything else verbatim so the reviewer sees exactly
-            // what will be applied.
+            // ── Clean raw plan output ─────────────────────────────────────────
             const rawPlan = fs.readFileSync(path.join(process.env.PLAN_DIR, 'plan.txt'), 'utf8');
             const cleanPlan = rawPlan
               .split('\n')
@@ -478,7 +479,7 @@ jobs:
               ? cleanPlan.slice(0, MAX) + '\n\n… truncated — download the artifact for the full output'
               : cleanPlan;
 
-            // ── Change counts ──────────────────────────────────────────────────
+            // ── Change counts ─────────────────────────────────────────────────
             const adds     = parseInt(process.env.ADDS,     10);
             const changes  = parseInt(process.env.CHANGES,  10);
             const destroys = parseInt(process.env.DESTROYS, 10);
@@ -493,40 +494,35 @@ jobs:
               replaces ? `↺${replaces}` : null,
             ].filter(Boolean).join('  ') || 'no changes';
 
-            // ── Destroy banner ─────────────────────────────────────────────────
+            // ── LLM outputs (with static fallbacks) ──────────────────────────
+            const displayId = process.env.DISPLAY_ID || process.env.STACK_ID;
+            const llmSummary = process.env.LLM_SUMMARY || '';
+            const llmCta     = process.env.LLM_CTA
+              || (hasChanges
+                ? 'Approve this PR to apply. Reviewers have been notified.'
+                : 'No infrastructure changes. Approve to merge.');
+
+            // ── Destroy banner ────────────────────────────────────────────────
             const destroyBanner = isDestroy
               ? '> [!WARNING]\n> **DESTROY MODE** — this plan will permanently delete infrastructure.\n\n'
               : (destroys > 0 || replaces > 0)
                 ? '> [!CAUTION]\n> This plan **destroys or replaces** resources. Review carefully.\n\n'
                 : '';
 
-            // ── Heading ────────────────────────────────────────────────────────
-            const displayId = process.env.DISPLAY_ID || process.env.STACK_ID;
-            const heading   = `#### \`${displayId}\` — ${countBadge}`;
-
-            // ── Policy line ────────────────────────────────────────────────────
+            // ── Policy line ───────────────────────────────────────────────────
             const policyLine = process.env.POLICY_DIR
               ? `**Policy:** \`${process.env.POLICY_DIR}\` ✅`
               : null;
 
-            // ── Call to action ─────────────────────────────────────────────────
-            const cta = hasChanges
-              ? '> Approve this PR to apply. Reviewers have been notified.'
-              : '> No infrastructure changes. Approve to merge.';
-
-            // ── LLM summary placeholder (populated by gravity-devops-agent v1) ─
-            const llmPlaceholder = '<!-- llm-summary -->';
-
-            // ── Assemble ───────────────────────────────────────────────────────
+            // ── Assemble ──────────────────────────────────────────────────────
             const marker = `<!-- devops-agent-plan:${process.env.STACK_ID} -->`;
             const lines = [
               marker,
-              heading,
+              `#### \`${displayId}\` — ${countBadge}`,
               '',
               destroyBanner,
               ...(policyLine ? [policyLine, ''] : []),
-              llmPlaceholder,
-              '',
+              ...(llmSummary ? [llmSummary, ''] : []),
               `<details><summary>Plan output</summary>`,
               '',
               '```',
@@ -535,7 +531,7 @@ jobs:
               '',
               '</details>',
               '',
-              cta,
+              `> ${llmCta}`,
             ];
 
             const body = lines.join('\n');

@@ -112,6 +112,23 @@ jobs:
           codeowners-path: ${{ inputs.codeowners-path }}
           github-token: ${{ steps.app-token.outputs.token }}
 
+      - name: Enrich with LLM
+        id: llm
+        if: steps.filter.outputs.proceed == 'true'
+        uses: infinity-constellation/ci-workflows/.github/actions/llm-comment@main
+        with:
+          event-type: ${{ steps.resolve.outputs.eligible == 'true' && 'apply-queued' || 'ineligible-approval' }}
+          openrouter-api-key: ${{ secrets.OPENROUTER_API_KEY }}
+          context-json: >-
+            {
+              "approver": "${{ github.event.review.user.login }}",
+              "eligible": ${{ steps.resolve.outputs.eligible == 'true' }},
+              "reason": ${{ toJSON(steps.resolve.outputs.reason) }},
+              "covering_owners": ${{ steps.resolve.outputs.covering-owners || '[]' }},
+              "unowned_paths": ${{ steps.resolve.outputs.unowned-paths || '[]' }},
+              "stacks": ${{ inputs.stacks }}
+            }
+
       - name: Comment ineligible approval
         if: steps.filter.outputs.proceed == 'true' && steps.resolve.outputs.eligible != 'true'
         uses: actions/github-script@v9
@@ -120,6 +137,9 @@ jobs:
           COVERING: ${{ steps.resolve.outputs.covering-owners }}
           UNOWNED: ${{ steps.resolve.outputs.unowned-paths }}
           APPROVER: ${{ github.event.review.user.login }}
+          LLM_SUMMARY: ${{ steps.llm.outputs.summary }}
+          LLM_CTA: ${{ steps.llm.outputs.cta }}
+          LLM_DIAGNOSIS: ${{ steps.llm.outputs.diagnosis }}
         with:
           github-token: ${{ steps.app-token.outputs.token }}
           script: |
@@ -127,21 +147,29 @@ jobs:
             const reason   = process.env.REASON;
             const covering = JSON.parse(process.env.COVERING || '[]');
             const unowned  = JSON.parse(process.env.UNOWNED  || '[]');
+            const llmSummary   = process.env.LLM_SUMMARY   || '';
+            const llmCta       = process.env.LLM_CTA       || '';
+            const llmDiagnosis = process.env.LLM_DIAGNOSIS || '';
 
             const lines = [
               marker,
               `#### Approval insufficient — @${process.env.APPROVER}`,
               '',
-              reason,
+              llmDiagnosis || reason,
             ];
-            if (unowned.length > 0) {
-              lines.push('', '**Paths with no CODEOWNERS entry** (add ownership to unblock):');
-              for (const p of unowned) lines.push(`- \`${p}\``);
-            } else if (covering.length > 0) {
-              lines.push('', '**Any one of these owners can approve:**');
-              for (const o of covering) lines.push(`- ${o}`);
+            if (!llmDiagnosis) {
+              if (unowned.length > 0) {
+                lines.push('', '**Paths with no CODEOWNERS entry** (add ownership to unblock):');
+                for (const p of unowned) lines.push(`- \`${p}\``);
+              } else if (covering.length > 0) {
+                lines.push('', '**Any one of these owners can approve:**');
+                for (const o of covering) lines.push(`- ${o}`);
+              }
             }
-            lines.push('', '_Approval recorded by GitHub but apply was not triggered._');
+            if (llmSummary) { lines.push('', llmSummary); }
+            lines.push('', llmCta
+              ? `> ${llmCta}`
+              : '_Approval recorded by GitHub but apply was not triggered._');
 
             const body = lines.join('\n');
             const { owner, repo } = context.repo;
@@ -208,27 +236,35 @@ jobs:
       - name: Comment apply queued
         if: steps.filter.outputs.proceed == 'true' && steps.dispatch.outputs.dispatched == 'true'
         uses: actions/github-script@v9
+        env:
+          LLM_DISPLAY_NAME: ${{ steps.llm.outputs.display_name }}
+          LLM_SUMMARY: ${{ steps.llm.outputs.summary }}
+          LLM_CTA: ${{ steps.llm.outputs.cta }}
         with:
           github-token: ${{ steps.app-token.outputs.token }}
           script: |
-            const marker = `<!-- devops-agent-approval-${process.env.APPROVER} -->`;
-
-            function toDisplayId(id) {
-              return id
-                .replace(/^live-/, '')
-                .replace(/^(infinity|labrynth)-aws-/, '')
-                .replace(/-(us-east-[12]|us-west-2|eu-west-1)-/g, '-')
-                .replace(/-/, ' · ');
-            }
+            const marker     = `<!-- devops-agent-approval-${process.env.APPROVER} -->`;
+            const llmDisplay = process.env.LLM_DISPLAY_NAME || '';
+            const llmSummary = process.env.LLM_SUMMARY      || '';
+            const llmCta     = process.env.LLM_CTA          || 'Apply is running in dependency order. The PR will auto-merge on success.';
 
             const stacks = JSON.parse(process.env.STACKS_JSON || '[]').map(s => s.stack_id);
-            const body = [
-              marker,
-              `#### Apply queued — approved by @${process.env.APPROVER}`,
-              '',
-              stacks.map(s => `- \`${toDisplayId(s)}\``).join('\n'),
-            ].join('\n');
+            function shortId(id) { return (id||'').split('-').slice(-3).join('-') || id; }
 
+            const lines = [
+              marker,
+              llmDisplay
+                ? `#### Apply queued — ${llmDisplay}`
+                : `#### Apply queued — approved by @${process.env.APPROVER}`,
+              '',
+              `Approved by @${process.env.APPROVER}`,
+              '',
+              stacks.map(s => `- \`${shortId(s)}\``).join('\n'),
+            ];
+            if (llmSummary) { lines.push('', llmSummary); }
+            lines.push('', `> ${llmCta}`);
+
+            const body = lines.join('\n');
             const { owner, repo } = context.repo;
             const issue_number = context.payload.pull_request.number;
             const { data: comments } = await github.rest.issues.listComments({ owner, repo, issue_number, per_page: 100 });
