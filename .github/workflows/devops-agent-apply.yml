@@ -198,9 +198,20 @@ jobs:
           git fetch origin "$DEFAULT_BRANCH" --depth=1 --quiet
 
           MAIN_TIP=$(git rev-parse "origin/$DEFAULT_BRANCH")
-          MERGE_BASE=$(git merge-base HEAD "origin/$DEFAULT_BRANCH")
 
-          if [ "$MERGE_BASE" != "$MAIN_TIP" ]; then
+          # With shallow clones, git merge-base may fail to find the common
+          # ancestor. Use the GitHub API instead — compare HEAD against the
+          # default branch to determine if it is behind (behind_by > 0).
+          COMPARE=$(gh api \
+            "repos/$GITHUB_REPOSITORY/compare/${MAIN_TIP}...${HEAD_SHA}" \
+            --jq '{status: .status, behind_by: .behind_by}' 2>/dev/null || echo '{}')
+          STATUS=$(echo "$COMPARE" | jq -r '.status // "unknown"')
+          BEHIND=$(echo "$COMPARE" | jq -r '.behind_by // 0')
+
+          # "ahead" = HEAD is ahead of main (normal for a PR).
+          # "identical" = same commit.
+          # "diverged" or "behind" = HEAD is missing commits from main.
+          if [ "$STATUS" = "behind" ] || ([ "$STATUS" = "diverged" ] && [ "$BEHIND" != "0" ]); then
             MSG="PR #$PR_NUMBER is not up-to-date with $DEFAULT_BRANCH."
             MSG="$MSG The plan was produced before $(git rev-parse --short "$MAIN_TIP") was merged;"
             MSG="$MSG applying it now could silently override or conflict with those changes."
@@ -210,7 +221,7 @@ jobs:
             exit 1
           fi
 
-          echo "PR branch is up-to-date with $DEFAULT_BRANCH (merge-base = $MAIN_TIP)"
+          echo "PR branch is up-to-date with $DEFAULT_BRANCH (status=$STATUS, behind_by=$BEHIND)"
 
       - name: Set up IaC tools
         uses: infinity-constellation/ci-workflows/.github/actions/setup-iac-tools@main
