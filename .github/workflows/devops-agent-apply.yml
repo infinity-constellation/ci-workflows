@@ -175,7 +175,37 @@ jobs:
           fi
           echo "Confirmed apply against authorized head $EXPECTED_SHA"
 
-      - name: Set up IaC tools
+      - name: Verify PR branch is up-to-date with main
+        env:
+          PR_NUMBER: ${{ inputs.pr-number }}
+          HEAD_SHA: ${{ inputs.head-sha }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          # Fetch just the tip of the default branch so we can compute the
+          # merge-base without a full clone. We use the GitHub API to get the
+          # default branch name rather than hard-coding "main".
+          DEFAULT_BRANCH=$(gh repo view "$GITHUB_REPOSITORY" --json defaultBranchRef \
+            --jq .defaultBranchRef.name)
+          git fetch origin "$DEFAULT_BRANCH" --depth=1 --quiet
+
+          MAIN_TIP=$(git rev-parse "origin/$DEFAULT_BRANCH")
+          MERGE_BASE=$(git merge-base HEAD "origin/$DEFAULT_BRANCH")
+
+          if [ "$MERGE_BASE" != "$MAIN_TIP" ]; then
+            MSG="PR #$PR_NUMBER is not up-to-date with $DEFAULT_BRANCH."
+            MSG="$MSG The plan was produced before $(git rev-parse --short "$MAIN_TIP") was merged;"
+            MSG="$MSG applying it now could silently override or conflict with those changes."
+            MSG="$MSG Rebase or merge $DEFAULT_BRANCH into this branch, re-run the plan,"
+            MSG="$MSG and get a fresh approval before applying."
+            echo "::error::$MSG"
+            exit 1
+          fi
+
+          echo "PR branch is up-to-date with $DEFAULT_BRANCH (merge-base = $MAIN_TIP)"
+
+
         uses: infinity-constellation/ci-workflows/.github/actions/setup-iac-tools@main
         with:
           terraform-version: ${{ inputs.terraform-version }}

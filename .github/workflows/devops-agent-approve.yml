@@ -158,6 +158,7 @@ jobs:
           DESTROY_CONFIRMED: ${{ inputs.destroy-confirmed }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          HEAD_BRANCH: ${{ github.event.pull_request.head.ref }}
           APPROVER_LOGIN: ${{ github.event.review.user.login }}
           REPO: ${{ github.repository }}
           REF: ${{ github.ref }}
@@ -186,11 +187,13 @@ jobs:
           STACKS_STR=$(echo "$INPUTS_JSON" | jq -r '.stacks')
           ARGS+=(-f "stacks=$STACKS_STR")
 
-          # Dispatch on the PR head ref so the apply workflow's
-          # `actions/checkout` defaults pick up the right commit.
+          # Dispatch on the PR head BRANCH (not SHA). GitHub's workflow_dispatch
+          # API requires a branch name or tag — a commit SHA is rejected with
+          # "No ref found for: <sha>". HEAD_SHA is still passed as an input so
+          # the apply workflow can validate it hasn't been superseded.
           gh workflow run "$APPLY_REF" \
             --repo "$REPO" \
-            --ref "$HEAD_SHA" \
+            --ref "$HEAD_BRANCH" \
             "${ARGS[@]}"
 
           echo "Dispatched apply workflow for PR #$PR_NUMBER (head=$HEAD_SHA, approver=$APPROVER_LOGIN)"
