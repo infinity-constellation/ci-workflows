@@ -114,6 +114,13 @@ jobs:
           # history; plan just needs the HCL files to be present.
           fetch-depth: 1
 
+      - name: Generate gravity-devops-agent token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.GRAVITY_DEVOPS_AGENT_APP_ID }}
+          private-key: ${{ secrets.GRAVITY_DEVOPS_AGENT_PRIVATE_KEY }}
+
       - name: Resolve configuration
         id: resolve
         env:
@@ -394,6 +401,8 @@ jobs:
       - name: Comment plan on PR
         if: ${{ steps.resolve.outputs.bootstrap != 'true' && github.event_name == 'pull_request' }}
         uses: actions/github-script@v9
+        with:
+          github-token: ${{ steps.app-token.outputs.token }}
         env:
           PLAN_DIR: ${{ steps.plan.outputs.plan_dir }}
           STACK_ID: ${{ steps.resolve.outputs.stack_id }}
@@ -470,6 +479,7 @@ jobs:
         if: ${{ steps.resolve.outputs.bootstrap == 'true' && github.event_name == 'pull_request' }}
         uses: actions/github-script@v9
         with:
+          github-token: ${{ steps.app-token.outputs.token }}
           script: |
             // ONE bootstrap comment per repo (not per stack). The marker is
             // intentionally not stack-scoped so a multi-stack PR doesn't post
