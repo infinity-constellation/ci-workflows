@@ -624,7 +624,7 @@ jobs:
               await github.rest.issues.createComment({ owner, repo, issue_number, body });
             }
 
-      - name: Enable auto-merge on success
+       - name: Merge PR on success
         if: ${{ inputs.auto-merge && steps.summarize.outputs.outcome == 'success' }}
         env:
           PR_NUMBER: ${{ inputs.pr-number }}
@@ -715,21 +715,43 @@ jobs:
           MERGE_METHOD=""
           MERGE_ERROR=""
           for method in "${ATTEMPT_LIST[@]}"; do
-            echo "Attempting auto-merge with method=$method ..."
-            # `gh pr merge --auto` enables auto-merge; GitHub completes the
-            # merge once required checks/reviews pass.
+            echo "Attempting direct merge with method=$method ..."
+            # Try a direct (immediate) merge first — works when the repo does
+            # not require auto-merge or when all required checks have already
+            # passed (which is always true at this point: the apply itself is
+            # the final required check).
             if OUTPUT=$(gh pr merge "$PR_NUMBER" \
                 --repo "$REPO" \
-                --auto \
                 "--$method" \
                 --body "$BODY" 2>&1); then
               MERGE_OK=true
               MERGE_METHOD="$method"
-              echo "Auto-merge enabled via $method."
+              echo "Merged via $method (direct)."
               break
+            fi
+
+            # Direct merge failed.  If the error mentions required checks or
+            # auto-merge, try enabling auto-merge so GitHub fires the merge
+            # once all checks complete.  This handles repos that enforce
+            # branch-protection required-status-checks.
+            if echo "$OUTPUT" | grep -qiE "required status|auto.merge|protected branch"; then
+              echo "Direct merge blocked by required checks; attempting --auto ..."
+              if AUTO_OUTPUT=$(gh pr merge "$PR_NUMBER" \
+                  --repo "$REPO" \
+                  --auto \
+                  "--$method" \
+                  --body "$BODY" 2>&1); then
+                MERGE_OK=true
+                MERGE_METHOD="$method"
+                echo "Auto-merge enabled via $method."
+                break
+              else
+                MERGE_ERROR="$AUTO_OUTPUT"
+                echo "::warning::Auto-merge with method=$method failed: $AUTO_OUTPUT"
+              fi
             else
               MERGE_ERROR="$OUTPUT"
-              echo "::warning::Auto-merge with method=$method failed: $OUTPUT"
+              echo "::warning::Direct merge with method=$method failed: $OUTPUT"
             fi
           done
 
