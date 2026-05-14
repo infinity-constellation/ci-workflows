@@ -596,14 +596,7 @@ jobs:
             // ── Update lifecycle comment (full rewrite) or per-stack comment ─
             const lifecycleId = process.env.LIFECYCLE_COMMENT_ID;
             if (lifecycleId && parseInt(lifecycleId)) {
-              // Full rewrite — replace the entire lifecycle comment body.
-              // The evaluating state (LLM opening + "Plan running...") is
-              // replaced with the complete plan result. For multi-stack PRs
-              // each plan job reads the current body, finds its own section
-              // (by stack marker) and upserts it, keeping other stacks' sections.
-              const lcMarker  = `<!-- devops-agent-pr:${issue_number} -->`;
               const stackMark = `<!-- devops-agent-stack:${process.env.STACK_ID} -->`;
-              const author    = context.payload.pull_request.user.login;
 
               const stackSection = [
                 stackMark,
@@ -635,15 +628,11 @@ jobs:
                 );
                 currentBody = currentBody.replace(sectionRegex, stackSection + '\n');
               } else {
-                // First plan for this stack — strip the pending indicator and append
+                // First plan for this stack — strip the pending indicator and append.
+                // Do NOT rewrite the header — evaluate already set a clean one.
                 currentBody = currentBody
                   .replace(/> ⏳ Plan running\.\.\.\n?/, '')
                   .replace(/\n_Plan results will appear here when complete\._\n?/, '');
-                // Replace generic header with final header on first completion
-                currentBody = currentBody.replace(
-                  /^(@\S+ — `.+`)\n/m,
-                  `@${author} — ${displayId}\n`
-                );
                 currentBody = currentBody.trimEnd() + '\n\n---\n\n' + stackSection;
               }
 
