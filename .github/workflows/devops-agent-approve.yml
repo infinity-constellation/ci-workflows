@@ -250,6 +250,8 @@ jobs:
 
           # gh workflow run takes -f key=value; build args.
           ARGS=()
+          # 'action' is required by infra.yml's workflow_dispatch to route to the apply job.
+          ARGS+=(-f "action=apply")
           for key in pr_number head_sha approver_login auto_merge destroy_confirmed; do
             VAL=$(echo "$INPUTS_JSON" | jq -r --arg k "$key" '.[$k]')
             ARGS+=(-f "$key=$VAL")
