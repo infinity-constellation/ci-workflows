@@ -122,6 +122,17 @@ jobs:
           app-id: ${{ secrets.GRAVITY_DEVOPS_AGENT_APP_ID }}
           private-key: ${{ secrets.GRAVITY_DEVOPS_AGENT_PRIVATE_KEY }}
 
+      - name: Start check run
+        id: check-run-start
+        if: github.event_name == 'pull_request'
+        uses: infinity-constellation/ci-workflows/.github/actions/check-run@main
+        with:
+          app-token: ${{ steps.app-token.outputs.token }}
+          name: plan · ${{ inputs.stack-id }}
+          head-sha: ${{ github.sha }}
+          status: in_progress
+          title: Planning ${{ inputs.stack-id }}
+
       - name: Resolve configuration
         id: resolve
         env:
@@ -601,3 +612,17 @@ jobs:
                 owner, repo, issue_number, body,
               });
             }
+
+
+      - name: Complete check run
+        if: always() && github.event_name == 'pull_request' && steps.check-run-start.outputs.check-run-id != ''
+        uses: infinity-constellation/ci-workflows/.github/actions/check-run@main
+        with:
+          app-token: ${{ steps.app-token.outputs.token }}
+          name: plan · ${{ steps.llm.outputs.display_name || inputs.stack-id }}
+          head-sha: ${{ github.sha }}
+          status: completed
+          conclusion: ${{ job.status == 'success' && 'success' || 'failure' }}
+          check-run-id: ${{ steps.check-run-start.outputs.check-run-id }}
+          title: ${{ steps.llm.outputs.display_name || inputs.stack-id }}
+          summary: ${{ steps.summarize.outputs.adds }} added · ${{ steps.summarize.outputs.changes }} changed · ${{ steps.summarize.outputs.destroys }} destroyed
