@@ -66,6 +66,7 @@ jobs:
             const marker   = `<!-- devops-agent-pr:${context.payload.pull_request.number} -->`;
             const llmMsg   = process.env.LLM_DETAILS || '';
             const stacks   = JSON.parse(process.env.STACKS_JSON || '[]');
+            const author   = context.payload.pull_request.user.login;
 
             function toDisplayId(id) {
               return id
@@ -75,16 +76,20 @@ jobs:
                 .replace(/-/, ' · ');
             }
 
-            const stackList = stacks.map(s => `- \`${toDisplayId(s.stack_id)}\``).join('\n');
+            const stackNames = stacks.map(s => toDisplayId(s.stack_id));
+            const stackTitle = stackNames.length === 1
+              ? `\`${stackNames[0]}\``
+              : `${stackNames.length} stacks`;
 
+            // Evaluating state: LLM message + stack list + pending indicator.
+            // The plan job will REPLACE this entire body when complete.
             const body = [
               marker,
+              `@${author} — ${stackTitle}`,
+              '',
               llmMsg || `Reviewing this PR — planning ${stacks.length} stack${stacks.length === 1 ? '' : 's'}...`,
               '',
-              `**Stacks in scope:**`,
-              stackList,
-              '',
-              `_Plan results will appear here when complete._`,
+              `> ⏳ Plan running...`,
             ].join('\n');
 
             const { owner, repo } = context.repo;

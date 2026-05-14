@@ -593,15 +593,20 @@ jobs:
               c.user && c.user.type === 'Bot' && c.body && c.body.includes(marker)
             );
 
-            // ── Update lifecycle comment or create per-stack comment ──────
+            // ── Update lifecycle comment (full rewrite) or per-stack comment ─
             const lifecycleId = process.env.LIFECYCLE_COMMENT_ID;
             if (lifecycleId && parseInt(lifecycleId)) {
-              const { data: lifecycle } = await github.rest.issues.getComment({
-                owner, repo, comment_id: parseInt(lifecycleId),
-              });
-              const currentBody = lifecycle.body || '';
+              // Full rewrite — replace the entire lifecycle comment body.
+              // The evaluating state (LLM opening + "Plan running...") is
+              // replaced with the complete plan result. For multi-stack PRs
+              // each plan job reads the current body, finds its own section
+              // (by stack marker) and upserts it, keeping other stacks' sections.
+              const lcMarker  = `<!-- devops-agent-pr:${issue_number} -->`;
+              const stackMark = `<!-- devops-agent-stack:${process.env.STACK_ID} -->`;
+              const author    = context.payload.pull_request.user.login;
+
               const stackSection = [
-                `\n---\n`,
+                stackMark,
                 `#### \`${displayId}\` — ${countBadge}`,
                 '',
                 destroyBanner,
@@ -616,12 +621,38 @@ jobs:
                 '',
                 '</details>',
               ].join('\n');
-              const updatedBody = currentBody
-                .replace('\n_Plan results will appear here when complete._', '')
-                + stackSection
-                + `\n\n> ${llmCta}`;
+
+              const { data: lifecycle } = await github.rest.issues.getComment({
+                owner, repo, comment_id: parseInt(lifecycleId),
+              });
+              let currentBody = lifecycle.body || '';
+
+              // Replace or append this stack's section
+              if (currentBody.includes(stackMark)) {
+                // Update existing section (re-run)
+                const sectionRegex = new RegExp(
+                  `${stackMark.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}[\\s\\S]*?(?=<!--|$)`,
+                );
+                currentBody = currentBody.replace(sectionRegex, stackSection + '\n');
+              } else {
+                // First plan for this stack — strip the pending indicator and append
+                currentBody = currentBody
+                  .replace(/> ⏳ Plan running\.\.\.\n?/, '')
+                  .replace(/\n_Plan results will appear here when complete\._\n?/, '');
+                // Replace generic header with final header on first completion
+                currentBody = currentBody.replace(
+                  /^(@\S+ — `.+`)\n/m,
+                  `@${author} — ${displayId}\n`
+                );
+                currentBody = currentBody.trimEnd() + '\n\n---\n\n' + stackSection;
+              }
+
+              // Add/update CTA at the end
+              currentBody = currentBody.replace(/\n> .+$/, '');
+              const finalBody = currentBody.trimEnd() + `\n\n> ${llmCta}`;
+
               await github.rest.issues.updateComment({
-                owner, repo, comment_id: parseInt(lifecycleId), body: updatedBody,
+                owner, repo, comment_id: parseInt(lifecycleId), body: finalBody,
               });
             } else if (existing) {
               await github.rest.issues.updateComment({
