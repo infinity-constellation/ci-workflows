@@ -541,7 +541,21 @@ jobs:
             ].filter(Boolean).join('  ') || 'no changes';
 
             // ── LLM outputs (with static fallbacks) ──────────────────────────
-            const displayId  = process.env.DISPLAY_ID  || process.env.STACK_ID;
+            // Normalize display ID — LLM sometimes uses dots or inconsistent
+            // separators. Apply the same toDisplayId() logic as evaluate.yml
+            // as a safety net, and fall back to stack_id if LLM returns empty.
+            function toDisplayId(id) {
+              return id
+                .replace(/^live-/, '')
+                .replace(/^(infinity|labrynth)-aws-/, '')
+                .replace(/-(us-east-[12]|us-west-2|eu-west-1)-/g, '-')
+                .replace(/-/, ' · ');
+            }
+            const rawDisplayId = process.env.DISPLAY_ID || process.env.STACK_ID;
+            // If LLM returned something with dots/wrong separators, normalize it
+            const displayId = rawDisplayId.includes('.') || rawDisplayId.includes('/')
+              ? toDisplayId(process.env.STACK_ID)
+              : rawDisplayId;
             const llmSummary = process.env.LLM_SUMMARY || '';
             const llmDetails = process.env.LLM_DETAILS || '';
             const llmCta     = process.env.LLM_CTA
