@@ -27,6 +27,10 @@ on:
         required: false
         type: string
         default: ".github/CODEOWNERS"
+    secrets:
+      github-token:
+        description: "Caller's GITHUB_TOKEN for posting commit statuses (requires statuses:write)."
+        required: false
     outputs:
       reviewers-requested:
         description: "Comma-separated list of users/teams review was requested from."
@@ -183,7 +187,7 @@ jobs:
         if: always()
         uses: actions/github-script@v9
         with:
-          github-token: ${{ steps.app-token.outputs.token }}
+          github-token: ${{ secrets.github-token || steps.app-token.outputs.token }}
           script: |
             // Post a pending commit status so the merge button is blocked
             // until a CODEOWNER approves. When branch protection is configured
