@@ -646,11 +646,11 @@ jobs:
           REPO: ${{ github.repository }}
           APPLIED_JSON: ${{ steps.summarize.outputs.applied_stacks }}
           APPROVER_LOGIN: ${{ inputs.approver-login }}
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
-          # GITHUB_TOKEN has metadata:read which is required to query repo
-          # merge settings. The App token lacks administration scope so
-          # allow_squash_merge / allow_rebase_merge come back null.
-          GITHUB_TOKEN_FOR_REPO_READ: ${{ github.token }}
+          # Use GITHUB_TOKEN for both the repo-settings read and the actual
+          # merge call. The App installation token lacks administration scope
+          # (so allow_squash_merge returns null) and cannot use the GraphQL
+          # mergePullRequest mutation ("Resource not accessible by integration").
+          GH_TOKEN: ${{ github.token }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           INPUT_MERGE_STRATEGY: ${{ inputs.merge-strategy }}
           VAR_MERGE_STRATEGY: ${{ vars.DEVOPS_AGENT_MERGE_STRATEGY }}
@@ -674,12 +674,9 @@ jobs:
           # ----------------------------------------------------------------
           # Resolve which merge methods are allowed by the repo.
           # ----------------------------------------------------------------
-          # GitHub returns `allow_squash_merge`, `allow_rebase_merge`,
-          # `allow_merge_commit` on the repo object. The agent walks the
-          # priority list and picks the first method allowed.
-          # Use the builtin GITHUB_TOKEN for this read — the App token
-          # lacks administration scope so the fields return null.
-          REPO_INFO=$(GH_TOKEN="$GITHUB_TOKEN_FOR_REPO_READ" gh api "repos/$REPO" --jq '{squash: .allow_squash_merge, rebase: .allow_rebase_merge, merge: .allow_merge_commit}')
+          # Use the same GH_TOKEN (GITHUB_TOKEN) for the repo settings read —
+          # it always has metadata:read.
+          REPO_INFO=$(gh api "repos/$REPO" --jq '{squash: .allow_squash_merge, rebase: .allow_rebase_merge, merge: .allow_merge_commit}')
           ALLOW_SQUASH=$(echo "$REPO_INFO" | jq -r '.squash')
           ALLOW_REBASE=$(echo "$REPO_INFO" | jq -r '.rebase')
           ALLOW_MERGE=$(echo "$REPO_INFO" | jq -r '.merge')
