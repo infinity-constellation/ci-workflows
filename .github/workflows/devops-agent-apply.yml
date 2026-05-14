@@ -577,13 +577,17 @@ jobs:
               .map(s => s.stack_id)
               .filter(id => !applied.includes(id) && id !== failed);
 
-            // Display name: prefer LLM, fall back to last segment of stack_id
-            function fallbackDisplay(id) {
-              return (id || '').split('-').slice(-3).join('-') || id;
+            // Display name: prefer LLM, fall back to toDisplayId
+            function toDisplayId(id) {
+              return (id || '')
+                .replace(/^live-/, '')
+                .replace(/^(infinity|labrynth)-aws-/, '')
+                .replace(/-(us-east-[12]|us-west-2|eu-west-1)-/g, ' · ')
+                .replace(/-/g, ' · ');
             }
             const primaryDisplay = llmDisplay || (outcome === 'success'
-              ? applied.map(fallbackDisplay).join(', ')
-              : fallbackDisplay(failed));
+              ? applied.map(toDisplayId).join(', ')
+              : toDisplayId(failed));
 
             const lines = [marker];
 
@@ -592,7 +596,7 @@ jobs:
               lines.push('');
               lines.push(`Approved by @${approver} · [run](${runUrl})`);
               lines.push('');
-              lines.push(applied.map(s => `- ✅ \`${fallbackDisplay(s)}\``).join('\n'));
+                lines.push(applied.map(s => `- ✅ \`${toDisplayId(s)}\``).join('\n'));
               if (llmSummary) { lines.push('', llmSummary); }
               if (llmDetails) { lines.push('', llmDetails); }
               if (llmCta)     { lines.push('', `> ${llmCta}`); }
@@ -605,13 +609,13 @@ jobs:
               lines.push('');
               if (applied.length > 0) {
                 lines.push('**Applied before failure:**');
-                lines.push(applied.map(s => `- ✅ \`${fallbackDisplay(s)}\``).join('\n'));
+              lines.push(applied.map(s => `- ✅ \`${toDisplayId(s)}\``).join('\n'));
                 lines.push('');
               }
-              lines.push(`**Failed:** \`${fallbackDisplay(failed)}\``);
+              lines.push(`**Failed:** \`${toDisplayId(failed)}\``);
               if (skipped.length > 0) {
                 lines.push('', '**Skipped (downstream of failure):**');
-                lines.push(skipped.map(s => `- ⏭️ \`${fallbackDisplay(s)}\``).join('\n'));
+                lines.push(skipped.map(s => `- ⏭️ \`${toDisplayId(s)}\``).join('\n'));
               }
               lines.push('');
               lines.push(llmCta
@@ -643,6 +647,10 @@ jobs:
           APPLIED_JSON: ${{ steps.summarize.outputs.applied_stacks }}
           APPROVER_LOGIN: ${{ inputs.approver-login }}
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          # GITHUB_TOKEN has metadata:read which is required to query repo
+          # merge settings. The App token lacks administration scope so
+          # allow_squash_merge / allow_rebase_merge come back null.
+          GITHUB_TOKEN_FOR_REPO_READ: ${{ github.token }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           INPUT_MERGE_STRATEGY: ${{ inputs.merge-strategy }}
           VAR_MERGE_STRATEGY: ${{ vars.DEVOPS_AGENT_MERGE_STRATEGY }}
@@ -669,7 +677,9 @@ jobs:
           # GitHub returns `allow_squash_merge`, `allow_rebase_merge`,
           # `allow_merge_commit` on the repo object. The agent walks the
           # priority list and picks the first method allowed.
-          REPO_INFO=$(gh api "repos/$REPO" --jq '{squash: .allow_squash_merge, rebase: .allow_rebase_merge, merge: .allow_merge_commit}')
+          # Use the builtin GITHUB_TOKEN for this read — the App token
+          # lacks administration scope so the fields return null.
+          REPO_INFO=$(GH_TOKEN="$GITHUB_TOKEN_FOR_REPO_READ" gh api "repos/$REPO" --jq '{squash: .allow_squash_merge, rebase: .allow_rebase_merge, merge: .allow_merge_commit}')
           ALLOW_SQUASH=$(echo "$REPO_INFO" | jq -r '.squash')
           ALLOW_REBASE=$(echo "$REPO_INFO" | jq -r '.rebase')
           ALLOW_MERGE=$(echo "$REPO_INFO" | jq -r '.merge')
