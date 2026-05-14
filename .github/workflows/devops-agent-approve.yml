@@ -71,6 +71,13 @@ jobs:
       eligible: ${{ steps.resolve.outputs.eligible }}
       apply_dispatched: ${{ steps.dispatch.outputs.dispatched }}
     steps:
+      - name: Generate gravity-devops-agent token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.GRAVITY_DEVOPS_AGENT_APP_ID }}
+          private-key: ${{ secrets.GRAVITY_DEVOPS_AGENT_PRIVATE_KEY }}
+
       - name: Filter to approval events
         id: filter
         env:
@@ -103,7 +110,7 @@ jobs:
           approver-login: ${{ github.event.review.user.login }}
           affected-paths: ${{ inputs.affected-paths }}
           codeowners-path: ${{ inputs.codeowners-path }}
-          github-token: ${{ github.token }}
+          github-token: ${{ steps.app-token.outputs.token }}
 
       - name: Comment ineligible approval
         if: steps.filter.outputs.proceed == 'true' && steps.resolve.outputs.eligible != 'true'
@@ -162,7 +169,7 @@ jobs:
           APPROVER_LOGIN: ${{ github.event.review.user.login }}
           REPO: ${{ github.repository }}
           REF: ${{ github.ref }}
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
           set -euo pipefail
 
@@ -202,10 +209,8 @@ jobs:
       - name: Comment apply queued
         if: steps.filter.outputs.proceed == 'true' && steps.dispatch.outputs.dispatched == 'true'
         uses: actions/github-script@v9
-        env:
-          APPROVER: ${{ github.event.review.user.login }}
-          STACKS_JSON: ${{ inputs.stacks }}
         with:
+          github-token: ${{ steps.app-token.outputs.token }}
           script: |
             const marker = `<!-- devops-agent-approval-${process.env.APPROVER} -->`;
             const stacks = JSON.parse(process.env.STACKS_JSON || '[]').map(s => s.stack_id);

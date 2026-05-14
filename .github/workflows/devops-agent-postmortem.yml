@@ -55,8 +55,17 @@ jobs:
   postmortem:
     runs-on: ${{ inputs.runs-on }}
     steps:
+      - name: Generate gravity-devops-agent token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.GRAVITY_DEVOPS_AGENT_APP_ID }}
+          private-key: ${{ secrets.GRAVITY_DEVOPS_AGENT_PRIVATE_KEY }}
+
       - name: Dismiss all current approvals
         uses: actions/github-script@v9
+        with:
+          github-token: ${{ steps.app-token.outputs.token }}
         env:
           PR_NUMBER: ${{ inputs.pr-number }}
         with:
@@ -84,6 +93,8 @@ jobs:
 
       - name: Add apply-failure label
         uses: actions/github-script@v9
+        with:
+          github-token: ${{ steps.app-token.outputs.token }}
         env:
           PR_NUMBER: ${{ inputs.pr-number }}
         with:
@@ -115,7 +126,7 @@ jobs:
         env:
           REPO: ${{ github.repository }}
           RUN_ID: ${{ inputs.apply-run-id }}
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
           FAILED_STACK: ${{ inputs.failed-stack }}
         run: |
           set -euo pipefail
@@ -190,6 +201,8 @@ jobs:
 
       - name: Post structured postmortem comment
         uses: actions/github-script@v9
+        with:
+          github-token: ${{ steps.app-token.outputs.token }}
         env:
           PR_NUMBER: ${{ inputs.pr-number }}
           FAILED_STACK: ${{ inputs.failed-stack }}
