@@ -43,11 +43,9 @@ jobs:
     outputs:
       reviewers_requested: ${{ steps.request.outputs.reviewers_requested }}
     steps:
-      - name: Checkout CODEOWNERS
+      - name: Checkout
         uses: actions/checkout@v6
         with:
-          sparse-checkout: ${{ inputs.codeowners-path }}
-          sparse-checkout-cone-mode: false
           fetch-depth: 1
 
       - name: Generate gravity-devops-agent token
