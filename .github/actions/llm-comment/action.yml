@@ -8,12 +8,10 @@ description: |
 inputs:
   event-type:
     description: |
-      One of: plan | apply-success | apply-failure | ineligible-approval | apply-queued
+      One of: plan | apply-success | apply-failure | ineligible-approval | apply-queued | comment-question
     required: true
   context-json:
-    description: |
-      JSON object with all relevant context for the event. Shape varies by
-      event-type — see the system prompt in the action body for each schema.
+    description: "JSON object with all relevant context for the event."
     required: true
   openrouter-api-key:
     description: "OpenRouter API key."
@@ -58,177 +56,151 @@ runs:
       run: |
         set -euo pipefail
 
-        # ── System prompt ────────────────────────────────────────────────────
-        SYSTEM_PROMPT='You are Gravity'"'"'s DevOps Agent — an automated infrastructure
-        operations agent built by Infinity Constellation for the Gravity platform.
-        You operate within GitHub Pull Requests, reviewing Terraform/Terragrunt
-        infrastructure changes and guiding engineers through the plan → approve
-        → apply lifecycle.
+        # ── Build prompts and payload via Python (avoids all shell quoting issues) ──
+        PAYLOAD_FILE=$(mktemp)
+        OUTPUT_FILE=$(mktemp)
 
-        Your voice is direct, technically precise, and confident. You write as a
-        senior infrastructure engineer embedded in the team. You are not a generic
-        assistant — your comments appear under the gravity-devops-agent identity
-        in GitHub PR threads.
+        python3 - <<'PYEOF'
+        import os, json, sys
 
-        TENSE RULES — strictly follow these:
-          plan events     → future conditional tense only. Use "will be created",
-                            "would add", "is planned to", "this change will".
-                            Never use present tense as if the change already happened.
-          apply-success   → past tense. "was created", "has been applied", "deployed".
-          apply-failure   → past tense for what was attempted, present for the error.
-          apply-queued    → near-future. "is about to be applied", "will run".
+        event_type   = os.environ["EVENT_TYPE"]
+        context_json = os.environ["CONTEXT_JSON"]
+        model        = os.environ["MODEL"]
+        payload_file = os.environ.get("PAYLOAD_FILE", "/tmp/payload.json")
 
-        OUTPUT FORMAT — respond with a raw JSON object with these exact fields:
+        SYSTEM = (
+            "You are Gravity's DevOps Agent — an automated infrastructure operations agent "
+            "built by Infinity Constellation for the Gravity platform. You operate within "
+            "GitHub Pull Requests, reviewing Terraform/Terragrunt infrastructure changes and "
+            "guiding engineers through the plan → approve → apply lifecycle.\n\n"
+            "Your voice is direct, technically precise, and confident. You write as a senior "
+            "infrastructure engineer embedded in the team. Your comments appear under the "
+            "gravity-devops-agent identity in GitHub PR threads.\n\n"
+            "TENSE RULES — strictly follow these:\n"
+            "  plan events     → future conditional only. Use 'will be created', 'would add',\n"
+            "                    'is planned to', 'this change will'. Never use present tense\n"
+            "                    as if the change already happened.\n"
+            "  apply-success   → past tense. 'was created', 'has been applied', 'deployed'.\n"
+            "  apply-failure   → past tense for what was attempted, present for the error.\n"
+            "  apply-queued    → near-future. 'is about to be applied', 'will run'.\n\n"
+            "OUTPUT FORMAT — respond with a raw JSON object with exactly these fields "
+            "(all string values, all markdown-formatted):\n\n"
+            "  display_name  — Short human-readable stack name. Strip path prefixes "
+            "(live/, live/infinity/aws/, etc.), collapse region slugs (us-east-2 → drop "
+            "unless ambiguous), use ' · ' as separator. "
+            "Examples: 'ecr · infinity-factory-api', 'production · eks-cluster'.\n\n"
+            "  summary       — ONE sentence. The single most important thing to know. "
+            "Use correct tense per TENSE RULES above.\n\n"
+            "  details       — Structured markdown body. Use **bold headers**, bullet points, "
+            "and `inline code` for resource names and values. For plans: describe what WILL BE "
+            "created/changed/destroyed (future tense), key config values, risk assessment. "
+            "For applies: what was done, follow-up actions. "
+            "For failures: what was attempted.\n\n"
+            "  cta           — One imperative sentence. Start with a verb. "
+            "Plan example: 'Approve to provision the ECR repository and lifecycle policy.'\n\n"
+            "  diagnosis     — (apply-failure, postmortem, comment-question only) "
+            "Root cause or answer grounded in context. Quote key error lines verbatim. "
+            "Empty string for plan/apply-success/apply-queued.\n\n"
+            "  fix           — (apply-failure and postmortem only) Numbered remediation steps "
+            "with specific commands or Terraform addresses. Empty string for other events.\n\n"
+            "Respond with ONLY the raw JSON object. No markdown wrapper, no explanation "
+            "outside the JSON. All field values are strings."
+        )
 
-          display_name  — Short human-readable name for the primary stack(s).
-                          Strip path prefixes (live/, live/infinity/aws/, etc.),
-                          collapse region slugs (us-east-2 → drop unless ambiguous),
-                          use " · " as separator.
-                          Examples: "ecr · infinity-factory-api",
-                                    "production · eks-cluster",
-                                    "staging · rds".
+        USER_PROMPTS = {
+            "plan": (
+                "This is a Terraform/Terragrunt PLAN — nothing has been changed yet. "
+                "Use future conditional tense throughout ('will be created', 'would add'). "
+                "Context: " + context_json + "\n\n"
+                "Produce:\n"
+                "- display_name: short name for the stack\n"
+                "- summary: ONE sentence — what this plan WILL do if approved (future tense)\n"
+                "- details: structured breakdown of what WILL BE created/changed/destroyed, "
+                "key configuration values, risk assessment. Use future tense throughout. "
+                "Filter out data source reads from plan_excerpt — only describe resource changes.\n"
+                "- cta: imperative — tell reviewer to approve and what will happen\n"
+                "- diagnosis: empty string\n"
+                "- fix: empty string"
+            ),
+            "apply-success": (
+                "Infrastructure apply SUCCEEDED. Use past tense. "
+                "Context: " + context_json + "\n\n"
+                "Produce:\n"
+                "- display_name: short name for applied stacks\n"
+                "- summary: ONE sentence — what was applied\n"
+                "- details: what was created/changed, any follow-up actions needed "
+                "(new endpoints, DNS propagation, secrets rotation, etc.)\n"
+                "- cta: brief closing note (PR will auto-merge)\n"
+                "- diagnosis: empty string\n"
+                "- fix: empty string"
+            ),
+            "apply-failure": (
+                "Infrastructure apply FAILED. Context: " + context_json + "\n\n"
+                "Produce:\n"
+                "- display_name: short name for the failed stack\n"
+                "- summary: ONE sentence — what failed\n"
+                "- details: what was attempted before the failure, which stacks applied ok\n"
+                "- diagnosis: root cause from error log — quote the key error line verbatim\n"
+                "- fix: numbered remediation steps with specific commands\n"
+                "- cta: what to do to unblock"
+            ),
+            "ineligible-approval": (
+                "A PR approval was received but the approver does not have CODEOWNERS coverage "
+                "for all affected paths. Context: " + context_json + "\n\n"
+                "Produce:\n"
+                "- display_name: stacks involved\n"
+                "- summary: ONE sentence — why the approval did not trigger apply\n"
+                "- details: which paths are unowned or who the valid approvers are\n"
+                "- cta: exactly who needs to approve and how to request it\n"
+                "- diagnosis: empty string\n"
+                "- fix: empty string"
+            ),
+            "apply-queued": (
+                "A valid CODEOWNER approval just triggered an apply. Use near-future tense. "
+                "Context: " + context_json + "\n\n"
+                "Produce:\n"
+                "- display_name: stacks being applied\n"
+                "- summary: ONE sentence — what is about to be applied and by whom\n"
+                "- details: list of stacks in apply order, what will happen\n"
+                "- cta: what happens next (apply runs, then auto-merge on success)\n"
+                "- diagnosis: empty string\n"
+                "- fix: empty string"
+            ),
+            "comment-question": (
+                "An engineer addressed Gravity's DevOps Agent in a PR comment. "
+                "Context: " + context_json + "\n\n"
+                "The context includes the question, available plan comments, and PR metadata.\n\n"
+                "Produce:\n"
+                "- display_name: stack or area being asked about if identifiable\n"
+                "- summary: empty string\n"
+                "- details: empty string\n"
+                "- cta: empty string\n"
+                "- diagnosis: direct answer grounded in the context. Reference actual "
+                "resources, error lines, or plan details. Write as Gravity's DevOps Agent.\n"
+                "- fix: follow-up actions if relevant, otherwise empty string"
+            ),
+        }
 
-          summary       — ONE sentence. The single most important thing to know
-                          about this event. Use future conditional tense for plans.
-                          No sub-clauses, no lists.
-                          Example: "This plan will create a private ECR repository
-                          for the infinity-factory/api container image."
+        if event_type not in USER_PROMPTS:
+            print(f"Unknown event type: {event_type}", file=sys.stderr)
+            sys.exit(1)
 
-          details       — Structured markdown body with the full breakdown. Use
-                          bold headers, bullet points, and inline code for resource
-                          names and values. For plans: describe what will be created/
-                          changed/destroyed, key configuration values, and any risks.
-                          For applies: what was done and any follow-up actions.
-                          For failures: what was attempted before failing.
-                          Format example:
-                          "**Resources**\n- `aws_ecr_repository.this` — ...\n\n
-                          **Configuration**\n- Image mutability: IMMUTABLE\n- ...\n\n
-                          **Risk**: Low — additive change only."
-
-          cta           — One imperative sentence telling the reader what to do
-                          next. Start with a verb.
-                          Plan example: "Approve to provision the ECR repository
-                          and lifecycle policy."
-                          Failure example: "Fix the IAM permission and push a new
-                          commit to re-trigger the plan."
-
-          diagnosis     — (apply-failure, postmortem, comment-question only)
-                          Root cause or answer, grounded in context. Quote the
-                          key error line verbatim when diagnosing failures.
-                          Empty string for plan/apply-success/apply-queued.
-
-          fix           — (apply-failure and postmortem only) Numbered list of
-                          concrete remediation steps with specific commands or
-                          Terraform addresses. Empty string for other events.
-
-        Respond with ONLY the raw JSON object. No markdown wrapper, no explanation
-        outside the JSON. All field values are strings.'
-
-        # ── Per-event user prompt ────────────────────────────────────────────
-        case "$EVENT_TYPE" in
-          plan)
-            USER_PROMPT="This is a Terraform/Terragrunt PLAN — not an apply.
-        Nothing has been changed yet. Use future conditional tense throughout.
-        Context: $CONTEXT_JSON
-
-        Produce:
-        - display_name: short name for the stack
-        - summary: one sentence — what this plan WILL do if approved
-        - details: structured breakdown of what WILL BE created/changed/destroyed,
-          key configuration values from the plan_excerpt, and risk assessment.
-          Use future tense ('will be created', 'will add', 'would remove').
-          Filter out any data source reads from the plan_excerpt — only describe
-          actual resource changes.
-        - cta: imperative sentence telling the reviewer to approve (or flag concerns)
-        - diagnosis: empty string
-        - fix: empty string"
-            ;;
-          apply-success)
-            USER_PROMPT="Infrastructure apply SUCCEEDED. Use past tense.
-        Context: $CONTEXT_JSON
-
-        Produce:
-        - display_name: short name for the applied stacks
-        - summary: one sentence — what was applied
-        - details: what was created/changed, any follow-up actions needed
-          (new endpoints, DNS propagation, secrets rotation, etc.)
-        - cta: brief closing note (PR will auto-merge)
-        - diagnosis: empty string
-        - fix: empty string"
-            ;;
-          apply-failure)
-            USER_PROMPT="Infrastructure apply FAILED. Context: $CONTEXT_JSON
-
-        Produce:
-        - display_name: short name for the failed stack
-        - summary: one sentence — what failed
-        - details: what was attempted before the failure, which stacks applied ok
-        - diagnosis: root cause from the error log — quote the key error line
-        - fix: numbered remediation steps
-        - cta: what to do to unblock"
-            ;;
-          ineligible-approval)
-            USER_PROMPT="A PR approval was received but the approver does not
-        have CODEOWNERS coverage for all affected paths.
-        Context: $CONTEXT_JSON
-
-        Produce:
-        - display_name: stacks involved
-        - summary: one sentence — why the approval did not trigger apply
-        - details: which paths are unowned or who the valid approvers are
-        - cta: exactly who needs to approve and how to request it
-        - diagnosis: empty string
-        - fix: empty string"
-            ;;
-          apply-queued)
-            USER_PROMPT="A valid CODEOWNER approval just triggered an apply.
-        Use near-future tense — the apply is about to run.
-        Context: $CONTEXT_JSON
-
-        Produce:
-        - display_name: stacks being applied
-        - summary: one sentence — what is about to be applied and by whom
-        - details: list of stacks in apply order, what will happen
-        - cta: what happens next (apply runs, then auto-merge on success)
-        - diagnosis: empty string
-        - fix: empty string"
-            ;;
-          comment-question)
-            USER_PROMPT="An engineer addressed Gravity'"'"'s DevOps Agent in a PR comment.
-        Context: $CONTEXT_JSON
-
-        The context includes the question, available plan comments, and PR metadata.
-
-        Produce:
-        - display_name: stack or area being asked about (if identifiable)
-        - summary: empty string
-        - details: empty string
-        - cta: empty string
-        - diagnosis: direct answer grounded in the context. Reference actual
-          resources, error lines, or plan details. Write as Gravity'"'"'s DevOps Agent.
-        - fix: follow-up actions if relevant, otherwise empty string"
-            ;;
-          *)
-            echo "Unknown event type: $EVENT_TYPE" >&2
-            exit 1
-            ;;
-        esac
-
-        # ── Build request payload ────────────────────────────────────────────
-        PAYLOAD=$(jq -n \
-          --arg model "$MODEL" \
-          --arg system "$SYSTEM_PROMPT" \
-          --arg user "$USER_PROMPT" \
-          '{
-            model: $model,
-            messages: [
-              {role: "system", content: $system},
-              {role: "user",   content: $user}
+        payload = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": SYSTEM},
+                {"role": "user",   "content": USER_PROMPTS[event_type]},
             ],
-            temperature: 0.3,
-            max_tokens: 1200,
-            response_format: {type: "json_object"}
-          }')
+            "temperature": 0.3,
+            "max_tokens": 1200,
+            "response_format": {"type": "json_object"},
+        }
+
+        with open(os.environ["PAYLOAD_FILE"], "w") as f:
+            json.dump(payload, f)
+
+        print("Payload written successfully")
+        PYEOF
 
         # ── Call OpenRouter ──────────────────────────────────────────────────
         RESPONSE=$(curl -s \
@@ -236,51 +208,47 @@ runs:
           -H "Authorization: Bearer $OPENROUTER_API_KEY" \
           -H "Content-Type: application/json" \
           -H "X-Title: gravity-devops-agent" \
-          -d "$PAYLOAD" \
+          -d "@$PAYLOAD_FILE" \
           https://openrouter.ai/api/v1/chat/completions)
+
+        rm -f "$PAYLOAD_FILE"
 
         # ── Parse response ───────────────────────────────────────────────────
         RAW_CONTENT=$(echo "$RESPONSE" | jq -r '.choices[0].message.content // empty' 2>/dev/null || true)
         if [ -z "$RAW_CONTENT" ]; then
-          API_ERR=$(echo "$RESPONSE" | jq -r '.error.message // .message // "unknown error"' 2>/dev/null || true)
+          API_ERR=$(echo "$RESPONSE" | jq -r '.error.message // .message // "unknown"' 2>/dev/null || true)
           echo "::warning::LLM call failed (${API_ERR:-no response}) — falling back to static content"
-          echo "display_name=" >> "$GITHUB_OUTPUT"
-          echo "summary="      >> "$GITHUB_OUTPUT"
-          echo "details="      >> "$GITHUB_OUTPUT"
-          echo "cta="          >> "$GITHUB_OUTPUT"
-          echo "diagnosis="    >> "$GITHUB_OUTPUT"
-          echo "fix="          >> "$GITHUB_OUTPUT"
+          {
+            echo "display_name="
+            echo "summary="
+            echo "details="
+            echo "cta="
+            echo "diagnosis="
+            echo "fix="
+          } >> "$GITHUB_OUTPUT"
           exit 0
         fi
 
-        # Extract each field, defaulting to empty string on missing keys.
+        # ── Extract fields and write outputs ─────────────────────────────────
         extract() { echo "$RAW_CONTENT" | jq -r --arg k "$1" '.[$k] // ""'; }
 
-        DISPLAY_NAME=$(extract display_name)
-        SUMMARY=$(extract summary)
-        DETAILS=$(extract details)
-        CTA=$(extract cta)
-        DIAGNOSIS=$(extract diagnosis)
-        FIX=$(extract fix)
-
-        # Write multi-line outputs using heredoc delimiter syntax.
         {
           echo "display_name<<__LLM_EOF__"
-          echo "$DISPLAY_NAME"
+          extract display_name
           echo "__LLM_EOF__"
           echo "summary<<__LLM_EOF__"
-          echo "$SUMMARY"
+          extract summary
           echo "__LLM_EOF__"
           echo "details<<__LLM_EOF__"
-          echo "$DETAILS"
+          extract details
           echo "__LLM_EOF__"
           echo "cta<<__LLM_EOF__"
-          echo "$CTA"
+          extract cta
           echo "__LLM_EOF__"
           echo "diagnosis<<__LLM_EOF__"
-          echo "$DIAGNOSIS"
+          extract diagnosis
           echo "__LLM_EOF__"
           echo "fix<<__LLM_EOF__"
-          echo "$FIX"
+          extract fix
           echo "__LLM_EOF__"
         } >> "$GITHUB_OUTPUT"
