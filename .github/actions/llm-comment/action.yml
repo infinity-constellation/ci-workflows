@@ -64,14 +64,17 @@ runs:
           https://openrouter.ai/api/v1/chat/completions)
         rm -f "$PAYLOAD_FILE"
         echo "After curl: RESPONSE_LEN=${#RESPONSE}"
+        echo "::debug::Response body: ${RESPONSE:0:500}"
         RAW_CONTENT=$(echo "$RESPONSE" | jq -r '.choices[0].message.content // empty' 2>/dev/null || true)
+        echo "RAW_CONTENT_LEN=${#RAW_CONTENT}"
         if [ -z "$RAW_CONTENT" ]; then
           API_ERR=$(echo "$RESPONSE" | jq -r '.error.message // .message // "unknown"' 2>/dev/null || true)
           echo "::warning::LLM call failed (${API_ERR:-no response}) — falling back to static content"
           printf 'display_name=\nsummary=\ndetails=\ncta=\ndiagnosis=\nfix=\n' >> "$GITHUB_OUTPUT"
           exit 0
         fi
-        extract() { echo "$RAW_CONTENT" | jq -r --arg k "$1" '.[$k] // ""'; }
+        echo "Extracting LLM fields..."
+        extract() { echo "$RAW_CONTENT" | jq -r --arg k "$1" '.[$k] // ""' 2>/dev/null || echo ""; }
         {
           echo "display_name<<__LLM_EOF__"; extract display_name; echo "__LLM_EOF__"
           echo "summary<<__LLM_EOF__";      extract summary;      echo "__LLM_EOF__"
