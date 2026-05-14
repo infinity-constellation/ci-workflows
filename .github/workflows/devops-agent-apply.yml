@@ -91,6 +91,7 @@ on:
         default: "ubuntu-latest"
 
 permissions:
+  checks: write            # check-run branding via gravity-devops-agent App
   contents: write           # apply produces commits/tags via auto-merge
   id-token: write           # OIDC
   pull-requests: write      # comment + auto-merge
@@ -116,6 +117,16 @@ jobs:
         with:
           app-id: ${{ secrets.GRAVITY_DEVOPS_AGENT_APP_ID }}
           private-key: ${{ secrets.GRAVITY_DEVOPS_AGENT_PRIVATE_KEY }}
+
+      - name: Start check run
+        id: check-run-start
+        uses: infinity-constellation/ci-workflows/.github/actions/check-run@main
+        with:
+          app-token: ${{ steps.app-token.outputs.token }}
+          name: gravity-devops-agent / apply
+          head-sha: ${{ inputs.head-sha }}
+          status: in_progress
+          title: Applying ${{ inputs.pr-number }}
 
       - name: Resolve configuration
         id: resolve
@@ -816,30 +827,45 @@ jobs:
             }
 
 
-      - name: Dispatch postmortem on failure
-        if: ${{ steps.summarize.outputs.outcome == 'failure' }}
-        env:
-          REPO: ${{ github.repository }}
-          PR_NUMBER: ${{ inputs.pr-number }}
-          STACKS_JSON: ${{ inputs.stacks }}
-          APPLIED_JSON: ${{ steps.summarize.outputs.applied_stacks }}
-          FAILED_STACK: ${{ steps.summarize.outputs.failed_stack }}
-          APPROVER_LOGIN: ${{ inputs.approver-login }}
-          APPLY_RUN_ID: ${{ github.run_id }}
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
-        run: |
-          set -euo pipefail
-          # The postmortem workflow path is conventional; callers that
-          # rename it must override this dispatch in their own caller.
-          POSTMORTEM_REF=".github/workflows/devops-agent-postmortem.yml"
+      - name: Complete check run
+        if: always() && steps.check-run-start.outputs.check-run-id != ''
+        uses: infinity-constellation/ci-workflows/.github/actions/check-run@main
+        with:
+          app-token: ${{ steps.app-token.outputs.token }}
+          name: gravity-devops-agent / apply
+          head-sha: ${{ inputs.head-sha }}
+          status: completed
+          conclusion: ${{ steps.summarize.outputs.outcome == 'success' && 'success' || 'failure' }}
+          check-run-id: ${{ steps.check-run-start.outputs.check-run-id }}
+          title: ${{ steps.summarize.outputs.outcome == 'success' && 'Applied' || 'Apply failed' }}
+          summary: ${{ steps.summarize.outputs.outcome == 'success' && 'All stacks applied successfully.' || format('Apply failed on stack: {0}', steps.summarize.outputs.failed_stack) }}
 
-          gh workflow run "$POSTMORTEM_REF" \
-            --repo "$REPO" \
-            --ref "$GITHUB_REF_NAME" \
-            -f "pr_number=$PR_NUMBER" \
-            -f "apply_run_id=$APPLY_RUN_ID" \
-            -f "applied_stacks=$APPLIED_JSON" \
-            -f "failed_stack=$FAILED_STACK" \
-            -f "stacks=$STACKS_JSON" \
-            -f "approver_login=$APPROVER_LOGIN"
-          echo "Dispatched postmortem workflow for PR #$PR_NUMBER (failed=$FAILED_STACK)"
+       - name: Dispatch postmortem on failure
+         if: ${{ steps.summarize.outputs.outcome == 'failure' }}
+         env:
+           REPO: ${{ github.repository }}
+           PR_NUMBER: ${{ inputs.pr-number }}
+           STACKS_JSON: ${{ inputs.stacks }}
+           APPLIED_JSON: ${{ steps.summarize.outputs.applied_stacks }}
+           FAILED_STACK: ${{ steps.summarize.outputs.failed_stack }}
+           APPROVER_LOGIN: ${{ inputs.approver-login }}
+           APPLY_RUN_ID: ${{ github.run_id }}
+           HEAD_SHA: ${{ inputs.head-sha }}
+           GH_TOKEN: ${{ steps.app-token.outputs.token }}
+         run: |
+           set -euo pipefail
+           # The postmortem workflow path is conventional; callers that
+           # rename it must override this dispatch in their own caller.
+           POSTMORTEM_REF=".github/workflows/devops-agent-postmortem.yml"
+
+           gh workflow run "$POSTMORTEM_REF" \
+             --repo "$REPO" \
+             --ref "$GITHUB_REF_NAME" \
+             -f "pr_number=$PR_NUMBER" \
+             -f "apply_run_id=$APPLY_RUN_ID" \
+             -f "applied_stacks=$APPLIED_JSON" \
+             -f "failed_stack=$FAILED_STACK" \
+             -f "stacks=$STACKS_JSON" \
+             -f "approver_login=$APPROVER_LOGIN" \
+             -f "head_sha=$HEAD_SHA"
+           echo "Dispatched postmortem workflow for PR #$PR_NUMBER (failed=$FAILED_STACK)"
