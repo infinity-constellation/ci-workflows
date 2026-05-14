@@ -1,7 +1,7 @@
 name: LLM comment enrichment
 description: |
   Calls OpenRouter to produce enriched comment content for gravity-devops-agent
-  PR comments. Always fails open — on any error outputs are empty strings.
+  PR comments. Always fails open.
 
 inputs:
   event-type:
@@ -61,25 +61,14 @@ runs:
           -H "Content-Type: application/json" \
           -H "X-Title: gravity-devops-agent" \
           -d "@$PAYLOAD_FILE" \
-          https://openrouter.ai/api/v1/chat/completions)
+          https://openrouter.ai/api/v1/chat/completions) || true
         rm -f "$PAYLOAD_FILE"
-        echo "After curl: RESPONSE_LEN=${#RESPONSE}"
-        echo "::debug::Response body: ${RESPONSE:0:500}"
         RAW_CONTENT=$(echo "$RESPONSE" | jq -r '.choices[0].message.content // empty' 2>/dev/null || true)
-        echo "RAW_CONTENT_LEN=${#RAW_CONTENT}"
         if [ -z "$RAW_CONTENT" ]; then
           API_ERR=$(echo "$RESPONSE" | jq -r '.error.message // .message // "unknown"' 2>/dev/null || true)
-          echo "::warning::LLM call failed (${API_ERR:-no response}) — falling back to static content"
-          printf 'display_name=\nsummary=\ndetails=\ncta=\ndiagnosis=\nfix=\n' >> "$GITHUB_OUTPUT"
+          echo "::warning::LLM call failed (${API_ERR:-no response}) — falling back"
+          printf "display_name=\nsummary=\ndetails=\ncta=\ndiagnosis=\nfix=\n" >> "$GITHUB_OUTPUT"
           exit 0
         fi
-        echo "Extracting LLM fields..."
-        extract() { echo "$RAW_CONTENT" | jq -r --arg k "$1" '.[$k] // ""' 2>/dev/null || echo ""; }
-        {
-          echo "display_name<<__LLM_EOF__"; extract display_name; echo "__LLM_EOF__"
-          echo "summary<<__LLM_EOF__";      extract summary;      echo "__LLM_EOF__"
-          echo "details<<__LLM_EOF__";      extract details;      echo "__LLM_EOF__"
-          echo "cta<<__LLM_EOF__";          extract cta;          echo "__LLM_EOF__"
-          echo "diagnosis<<__LLM_EOF__";    extract diagnosis;    echo "__LLM_EOF__"
-          echo "fix<<__LLM_EOF__";          extract fix;          echo "__LLM_EOF__"
-        } >> "$GITHUB_OUTPUT"
+        export RAW_CONTENT
+        python3 -c "import base64,os,sys; exec(compile(base64.b64decode('aW1wb3J0IG9zLGpzb24sc3lzCnJhdz1vcy5lbnZpcm9uLmdldCgnUkFXX0NPTlRFTlQnLCcnKQp0cnk6IGQ9anNvbi5sb2FkcyhyYXcpCmV4Y2VwdCBFeGNlcHRpb24gYXMgZToKICAgIGltcG9ydCBzeXM7IHByaW50KGYnOjp3YXJuaW5nOjpGYWlsZWQgdG8gcGFyc2UgTExNIEpTT046IHtlfScsZmx1c2g9VHJ1ZSk7IHN5cy5leGl0KDApCmdobz1vcy5lbnZpcm9uLmdldCgnR0lUSFVCX09VVFBVVCcsJycpCmlmIG5vdCBnaG86IHN5cy5leGl0KDApCndpdGggb3BlbihnaG8sJ2EnKSBhcyBmOgogICAgZm9yIGZpZWxkIGluIFsnZGlzcGxheV9uYW1lJywnc3VtbWFyeScsJ2RldGFpbHMnLCdjdGEnLCdkaWFnbm9zaXMnLCdmaXgnXToKICAgICAgICB2YWw9c3RyKGQuZ2V0KGZpZWxkLCcnKSBvciAnJykKICAgICAgICBmLndyaXRlKGYne2ZpZWxkfTw8X19MTE1fRU9GX18Ke3ZhbH0KX19MTE1fRU9GX18KJykKcHJpbnQoJ0xMTSBvdXRwdXRzIHdyaXR0ZW4nLGZsdXNoPVRydWUpCg==').decode(),'<extract>','exec'))"

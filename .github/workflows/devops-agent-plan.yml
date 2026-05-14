@@ -396,11 +396,11 @@ jobs:
           # 1. Strip Terragrunt timestamp prefix
           # 2. Strip data source lifecycle lines (Reading, Read complete, Still reading)
           # 3. Strip blank lines that result from removals
-          PLAN_EXCERPT=$(cat "$PLAN_DIR/plan.txt" \
-            | sed 's/^[0-9][0-9]:[0-9][0-9]:[0-9][0-9]\.[0-9]* STDOUT terraform: //' \
-            | grep -vE '^data\.[^[:space:]]+ .+: (Reading\.\.\.|Read complete after|Still reading\.\.\.|Refreshing state)' \
-            | grep -vE '^$' \
-            | head -c 3000 || true)
+           PLAN_EXCERPT=$(cat "$PLAN_DIR/plan.txt" \
+             | sed 's/^[0-9][0-9]:[0-9][0-9]:[0-9][0-9]\.[0-9]* STDOUT terraform: //' \
+             | grep -vE '^data\.[^[:space:]]+ .+:\s*(Reading\.\.\.|Read complete|Still reading|Refreshing state)' \
+             | grep -vE '^$' \
+             | head -c 3000 || true)
           {
             echo "plan_excerpt<<__PLAN_EOF__"
             echo "$PLAN_EXCERPT"
@@ -486,7 +486,7 @@ jobs:
             const cleanPlan = rawPlan
               .split('\n')
               .map(l => l.replace(/^\d{2}:\d{2}:\d{2}\.\d+ STDOUT terraform: /, ''))
-              .filter(l => !/^data\.[^\s]+ .+: (Reading\.\.\.|Read complete after|Still reading\.\.\.)/.test(l.trim()))
+              .filter(l => !/^data\.[^\s]+ .+:\s*(Reading\.\.\.|Read complete|Still reading|Refreshing state)/.test(l.trim()))
               .join('\n')
               .trim();
 
