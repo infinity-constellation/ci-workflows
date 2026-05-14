@@ -121,6 +121,7 @@ jobs:
           UNOWNED: ${{ steps.resolve.outputs.unowned-paths }}
           APPROVER: ${{ github.event.review.user.login }}
         with:
+          github-token: ${{ steps.app-token.outputs.token }}
           script: |
             const marker = `<!-- devops-agent-approval-${process.env.APPROVER} -->`;
             const reason = process.env.REASON;
