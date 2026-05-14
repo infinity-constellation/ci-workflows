@@ -203,7 +203,7 @@ jobs:
         if: steps.filter.outputs.proceed == 'true' && steps.resolve.outputs.eligible == 'true'
         uses: actions/github-script@v9
         with:
-          github-token: ${{ secrets.github-token || steps.app-token.outputs.token }}
+          github-token: ${{ steps.app-token.outputs.token }}
           script: |
             const sha     = context.payload.pull_request?.head?.sha;
             const approver = context.payload.review?.user?.login || 'unknown';
