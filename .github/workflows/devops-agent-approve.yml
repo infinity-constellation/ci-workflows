@@ -60,7 +60,16 @@ on:
         value: ${{ jobs.evaluate.outputs.apply_dispatched }}
     secrets:
       github-token:
-        description: "Caller's GITHUB_TOKEN for posting commit statuses (statuses:write)."
+        description: "Caller's GITHUB_TOKEN for posting commit statuses."
+        required: false
+      GRAVITY_DEVOPS_AGENT_APP_ID:
+        description: "GitHub App ID for the gravity-devops-agent App."
+        required: false
+      GRAVITY_DEVOPS_AGENT_PRIVATE_KEY:
+        description: "GitHub App private key for the gravity-devops-agent App."
+        required: false
+      OPENROUTER_API_KEY:
+        description: "OpenRouter API key for LLM enrichment."
         required: false
 
 permissions:
