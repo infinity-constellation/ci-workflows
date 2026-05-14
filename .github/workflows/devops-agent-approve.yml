@@ -123,27 +123,25 @@ jobs:
         with:
           github-token: ${{ steps.app-token.outputs.token }}
           script: |
-            const marker = `<!-- devops-agent-approval-${process.env.APPROVER} -->`;
-            const reason = process.env.REASON;
+            const marker   = `<!-- devops-agent-approval-${process.env.APPROVER} -->`;
+            const reason   = process.env.REASON;
             const covering = JSON.parse(process.env.COVERING || '[]');
-            const unowned = JSON.parse(process.env.UNOWNED || '[]');
+            const unowned  = JSON.parse(process.env.UNOWNED  || '[]');
 
             const lines = [
               marker,
-              `### gravity-devops-agent — Approval not yet sufficient ⏸️`,
-              '',
-              `Approver: @${process.env.APPROVER}`,
+              `#### Approval insufficient — @${process.env.APPROVER}`,
               '',
               reason,
             ];
             if (unowned.length > 0) {
-              lines.push('', `**Paths with no CODEOWNERS rule** (add ownership to enable auto-apply):`);
+              lines.push('', '**Paths with no CODEOWNERS entry** (add ownership to unblock):');
               for (const p of unowned) lines.push(`- \`${p}\``);
             } else if (covering.length > 0) {
-              lines.push('', `**Owners that together cover this PR** (any one is sufficient):`);
+              lines.push('', '**Any one of these owners can approve:**');
               for (const o of covering) lines.push(`- ${o}`);
             }
-            lines.push('', '_The approval was recorded by GitHub but did not trigger an apply._');
+            lines.push('', '_Approval recorded by GitHub but apply was not triggered._');
 
             const body = lines.join('\n');
             const { owner, repo } = context.repo;
@@ -214,19 +212,21 @@ jobs:
           github-token: ${{ steps.app-token.outputs.token }}
           script: |
             const marker = `<!-- devops-agent-approval-${process.env.APPROVER} -->`;
+
+            function toDisplayId(id) {
+              return id
+                .replace(/^live-/, '')
+                .replace(/^(infinity|labrynth)-aws-/, '')
+                .replace(/-(us-east-[12]|us-west-2|eu-west-1)-/g, '-')
+                .replace(/-/, ' · ');
+            }
+
             const stacks = JSON.parse(process.env.STACKS_JSON || '[]').map(s => s.stack_id);
-            const stackList = stacks.map(s => `- \`${s}\``).join('\n');
             const body = [
               marker,
-              `### gravity-devops-agent — Apply queued ▶️`,
+              `#### Apply queued — approved by @${process.env.APPROVER}`,
               '',
-              `Approval by @${process.env.APPROVER} covers all affected paths per CODEOWNERS. Apply dispatched in dependency order.`,
-              '',
-              `**Stacks**:`,
-              stackList,
-              '',
-              `On success: PR will be auto-squash-merged with a structured trailer.`,
-              `On failure: approvals will be dismissed and a postmortem comment posted.`,
+              stacks.map(s => `- \`${toDisplayId(s)}\``).join('\n'),
             ].join('\n');
 
             const { owner, repo } = context.repo;

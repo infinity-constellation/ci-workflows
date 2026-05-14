@@ -215,48 +215,61 @@ jobs:
           github-token: ${{ steps.app-token.outputs.token }}
           script: |
             const fs = require('fs');
-            const marker = `<!-- devops-agent-postmortem -->`;
-            const failed = process.env.FAILED_STACK;
+            const marker  = `<!-- devops-agent-postmortem -->`;
+            const failed  = process.env.FAILED_STACK;
             const applied = JSON.parse(process.env.APPLIED_JSON || '[]');
-            const stacks = JSON.parse(process.env.STACKS_JSON || '[]').map(s => s.stack_id);
+            const stacks  = JSON.parse(process.env.STACKS_JSON  || '[]').map(s => s.stack_id);
             const skipped = stacks.filter(s => !applied.includes(s) && s !== failed);
+            const runUrl  = `${process.env.SERVER_URL}/${process.env.REPO}/actions/runs/${process.env.APPLY_RUN_ID}`;
+
+            // Derive short display IDs (mirrors plan workflow logic)
+            function toDisplayId(id) {
+              return id
+                .replace(/^live-/, '')
+                .replace(/^(infinity|labrynth)-aws-/, '')
+                .replace(/-(us-east-[12]|us-west-2|eu-west-1)-/g, '-')
+                .replace(/-/, ' · ');
+            }
 
             const tail = fs.readFileSync(process.env.TAIL_FILE, 'utf8').slice(-12000);
-            const runUrl = `${process.env.SERVER_URL}/${process.env.REPO}/actions/runs/${process.env.APPLY_RUN_ID}`;
 
             const lines = [
               marker,
-              `### gravity-devops-agent — Postmortem 🔍`,
+              `#### Postmortem — \`${toDisplayId(failed)}\``,
               '',
-              `**Apply failed.** Approvals on this PR have been dismissed; please re-review after the fix.`,
+              `Approved by @${process.env.APPROVER} · [apply run](${runUrl})`,
               '',
-              `| | |`,
-              `|---|---|`,
-              `| Failed stack | \`${failed}\` |`,
-              `| Approver (dismissed) | @${process.env.APPROVER} |`,
-              `| Apply run | [${process.env.APPLY_RUN_ID}](${runUrl}) |`,
-              `| Error category | \`${process.env.CATEGORY}\` |`,
+              `**What happened:** apply failed on \`${toDisplayId(failed)}\`. Approvals have been dismissed; re-review after fixing.`,
               '',
-              `**Applied successfully (state may be partially advanced):**`,
-              applied.length > 0 ? applied.map(s => `- ✅ \`${s}\``).join('\n') : '_none_',
+              `**Error category:** \`${process.env.CATEGORY}\``,
               '',
-              `**Skipped (downstream of failure):**`,
-              skipped.length > 0 ? skipped.map(s => `- ⏭️ \`${s}\``).join('\n') : '_none_',
+              `**Suggested fix:** ${process.env.SUGGESTION}`,
+            ];
+
+            if (applied.length > 0) {
+              lines.push('');
+              lines.push('**Applied before failure:**');
+              lines.push(applied.map(s => `- ✅ \`${toDisplayId(s)}\``).join('\n'));
+            }
+
+            if (skipped.length > 0) {
+              lines.push('');
+              lines.push('**Skipped (downstream of failure):**');
+              lines.push(skipped.map(s => `- ⏭️ \`${toDisplayId(s)}\``).join('\n'));
+            }
+
+            lines.push(
               '',
-              `### Suggested next step`,
-              '',
-              process.env.SUGGESTION,
-              '',
-              `<details><summary>Failed apply log tail</summary>`,
+              `<details><summary>Failed stack log tail</summary>`,
               '',
               '```',
               tail,
               '```',
               '',
-              `</details>`,
+              '</details>',
               '',
-              `_LLM-suggested fixes are intentionally disabled in v0; the suggestion above is from a static playbook keyed on \`${process.env.CATEGORY}\`. To enable LLM suggestions, set the \`enable-llm-suggestions\` input on the caller workflow once that feature ships in v0.5._`,
-            ];
+              `<!-- llm-summary -->`,
+            );
 
             const body = lines.join('\n');
             const issue_number = parseInt(process.env.PR_NUMBER, 10);

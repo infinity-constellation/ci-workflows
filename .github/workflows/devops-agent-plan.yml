@@ -102,6 +102,7 @@ jobs:
     outputs:
       plan-artifact: ${{ steps.resolve.outputs.plan_artifact }}
       stack-id: ${{ steps.resolve.outputs.stack_id }}
+      display-id: ${{ steps.display.outputs.display_id }}
       engine: ${{ steps.detect.outputs.engine }}
       has-changes: ${{ steps.summarize.outputs.has_changes }}
       bootstrap: ${{ steps.resolve.outputs.bootstrap }}
@@ -192,6 +193,39 @@ jobs:
             echo "role_session_name=$ROLE_SESSION_NAME"
             echo "bootstrap=$BOOTSTRAP"
           } >> "$GITHUB_OUTPUT"
+
+      - name: Derive display ID
+        id: display
+        if: steps.resolve.outputs.bootstrap != 'true'
+        env:
+          STACK_ID: ${{ steps.resolve.outputs.stack_id }}
+        run: |
+          set -euo pipefail
+          # Produce a short human-readable display_id from the full stack_id.
+          # Rules (applied in order):
+          #   1. Strip leading "live-"
+          #   2. Collapse known region slugs to compact forms
+          #   3. Strip BU name prefix if it matches the repo owner (optional — best-effort)
+          #   4. Replace first "-aws-" separator with " · " to visually group provider
+          #   5. Remaining hyphens are preserved (resource names keep their dashes)
+          # Examples:
+          #   live-infinity-aws-ecr-infinity-factory-api  → ecr · infinity-factory-api
+          #   live-infinity-aws-production-us-east-2-eks-cluster → production · eks-cluster
+          #   live-labrynth-aws-staging-us-east-2-vpc     → staging · vpc
+          id="${STACK_ID#live-}"               # strip leading "live-"
+          id="${id#infinity-aws-}"             # strip "infinity-aws-"
+          id="${id#labrynth-aws-}"             # strip "labrynth-aws-"
+          id="${id//-us-east-2-/-}"            # collapse region slugs
+          id="${id//-us-east-1-/-}"
+          id="${id//-us-west-2-/-}"
+          id="${id//-eu-west-1-/-}"
+          # Insert visual separator before the resource name portion:
+          # if id contains exactly one remaining hyphen group that looks like
+          # "env-resource", split at first hyphen into "env · resource"
+          # We do this by replacing the FIRST hyphen with " · "
+          # but only when there's more than one segment.
+          DISPLAY=$(echo "$id" | sed 's/-/ · /')
+          echo "display_id=$DISPLAY" >> "$GITHUB_OUTPUT"
 
       - name: Detect engine
         id: detect
@@ -342,6 +376,7 @@ jobs:
           PLAN_DIR: ${{ steps.plan.outputs.plan_dir }}
           PLAN_EXIT: ${{ steps.plan.outputs.plan_exit }}
           STACK_ID: ${{ steps.resolve.outputs.stack_id }}
+          DISPLAY_ID: ${{ steps.display.outputs.display_id }}
           DESTROY: ${{ inputs.destroy }}
           ENGINE: ${{ steps.detect.outputs.engine }}
         run: |
@@ -371,18 +406,22 @@ jobs:
             echo "replaces=$REPLACES"
           } >> "$GITHUB_OUTPUT"
 
+          # Step summary (Actions tab)
           {
-            echo "## DevOps Agent — Plan: \`$STACK_ID\`"
-            echo ""
-            echo "**Engine**: \`$ENGINE\`"
             if [ "$DESTROY" = "true" ]; then
-              echo "**Mode**: \`-destroy\`"
+              echo "## ⚠️ DESTROY — \`$DISPLAY_ID\`"
+            elif [ "$HAS_CHANGES" = "true" ]; then
+              echo "## Plan — \`$DISPLAY_ID\`"
+            else
+              echo "## Plan — \`$DISPLAY_ID\` (no changes)"
             fi
-            echo "**Adds**: $ADDS  **Changes**: $CHANGES  **Destroys**: $DESTROYS  **Replaces**: $REPLACES"
+            echo ""
+            echo "| + add | ~ change | - destroy | ↺ replace |"
+            echo "|---|---|---|---|"
+            echo "| $ADDS | $CHANGES | $DESTROYS | $REPLACES |"
             if [ "$DESTROYS" -gt 0 ] || [ "$REPLACES" -gt 0 ]; then
               echo ""
-              echo "### Resources DESTROYED or REPLACED"
-              echo ""
+              echo "### Resources to destroy or replace"
               echo '```'
               echo "$DESTROY_NAMES"
               echo '```'
@@ -404,11 +443,13 @@ jobs:
         env:
           PLAN_DIR: ${{ steps.plan.outputs.plan_dir }}
           STACK_ID: ${{ steps.resolve.outputs.stack_id }}
+          DISPLAY_ID: ${{ steps.display.outputs.display_id }}
           ENGINE: ${{ steps.detect.outputs.engine }}
           ADDS: ${{ steps.summarize.outputs.adds }}
           CHANGES: ${{ steps.summarize.outputs.changes }}
           DESTROYS: ${{ steps.summarize.outputs.destroys }}
           REPLACES: ${{ steps.summarize.outputs.replaces }}
+          HAS_CHANGES: ${{ steps.summarize.outputs.has_changes }}
           PLAN_ARTIFACT: ${{ steps.resolve.outputs.plan_artifact }}
           DESTROY: ${{ inputs.destroy }}
           POLICY_DIR: ${{ inputs.policy-dir }}
@@ -417,43 +458,87 @@ jobs:
           script: |
             const fs = require('fs');
             const path = require('path');
-            const planText = fs.readFileSync(path.join(process.env.PLAN_DIR, 'plan.txt'), 'utf8');
 
-            const MAX = 60000;
-            const body = planText.length > MAX
-              ? planText.slice(0, MAX) + '\n\n... (truncated, see workflow artifact for full plan)'
-              : planText;
+            // ── Clean raw plan output ──────────────────────────────────────────
+            // Strip the "HH:MM:SS.NNN STDOUT terraform: " prefix that Terragrunt
+            // adds to every line, and remove noisy data-source read lines that
+            // aren't relevant to a reviewer (they confirm existing infra, not
+            // changes). Keep everything else verbatim so the reviewer sees exactly
+            // what will be applied.
+            const rawPlan = fs.readFileSync(path.join(process.env.PLAN_DIR, 'plan.txt'), 'utf8');
+            const cleanPlan = rawPlan
+              .split('\n')
+              .map(l => l.replace(/^\d{2}:\d{2}:\d{2}\.\d+ STDOUT terraform: /, ''))
+              .filter(l => !/^data\.[^\s]+ .+: (Reading\.\.\.|Read complete after|Still reading\.\.\.)/.test(l.trim()))
+              .join('\n')
+              .trim();
 
-            const marker = `<!-- devops-agent-plan:${process.env.STACK_ID} -->`;
-            const destroyBanner = process.env.DESTROY === 'true'
-              ? '> :warning: **DESTROY PLAN** — this PR is plan-as-destroy.\n\n'
-              : '';
+            const MAX = 56000;
+            const planBody = cleanPlan.length > MAX
+              ? cleanPlan.slice(0, MAX) + '\n\n… truncated — download the artifact for the full output'
+              : cleanPlan;
+
+            // ── Change counts ──────────────────────────────────────────────────
+            const adds     = parseInt(process.env.ADDS,     10);
+            const changes  = parseInt(process.env.CHANGES,  10);
+            const destroys = parseInt(process.env.DESTROYS, 10);
+            const replaces = parseInt(process.env.REPLACES, 10);
+            const hasChanges = process.env.HAS_CHANGES === 'true';
+            const isDestroy  = process.env.DESTROY === 'true';
+
+            const countBadge = [
+              adds     ? `+${adds}`     : null,
+              changes  ? `~${changes}`  : null,
+              destroys ? `-${destroys}` : null,
+              replaces ? `↺${replaces}` : null,
+            ].filter(Boolean).join('  ') || 'no changes';
+
+            // ── Destroy banner ─────────────────────────────────────────────────
+            const destroyBanner = isDestroy
+              ? '> [!WARNING]\n> **DESTROY MODE** — this plan will permanently delete infrastructure.\n\n'
+              : (destroys > 0 || replaces > 0)
+                ? '> [!CAUTION]\n> This plan **destroys or replaces** resources. Review carefully.\n\n'
+                : '';
+
+            // ── Heading ────────────────────────────────────────────────────────
+            const displayId = process.env.DISPLAY_ID || process.env.STACK_ID;
+            const heading   = `#### \`${displayId}\` — ${countBadge}`;
+
+            // ── Policy line ────────────────────────────────────────────────────
             const policyLine = process.env.POLICY_DIR
-              ? `Policy: \`${process.env.POLICY_DIR}\` ✅\n`
-              : 'Policy: _none configured_\n';
+              ? `**Policy:** \`${process.env.POLICY_DIR}\` ✅`
+              : null;
 
-            const header = [
+            // ── Call to action ─────────────────────────────────────────────────
+            const cta = hasChanges
+              ? '> Approve this PR to apply. Reviewers have been notified.'
+              : '> No infrastructure changes. Approve to merge.';
+
+            // ── LLM summary placeholder (populated by gravity-devops-agent v1) ─
+            const llmPlaceholder = '<!-- llm-summary -->';
+
+            // ── Assemble ───────────────────────────────────────────────────────
+            const marker = `<!-- devops-agent-plan:${process.env.STACK_ID} -->`;
+            const lines = [
               marker,
-              `### gravity-devops-agent — Plan \`${process.env.STACK_ID}\``,
+              heading,
               '',
               destroyBanner,
-              `**Engine**: \`${process.env.ENGINE}\``,
-              `**Adds**: ${process.env.ADDS}  **Changes**: ${process.env.CHANGES}  **Destroys**: ${process.env.DESTROYS}  **Replaces**: ${process.env.REPLACES}`,
+              ...(policyLine ? [policyLine, ''] : []),
+              llmPlaceholder,
               '',
-              policyLine,
-              `Artifact: \`${process.env.PLAN_ARTIFACT}\`  (downloadable from the workflow run)`,
+              `<details><summary>Plan output</summary>`,
               '',
-              'When this PR is approved by a CODEOWNER for every affected path, the DevOps Agent will apply this plan in dependency order and auto-merge on success. On failure, approvals are dismissed and a postmortem comment is posted.',
-              '',
-              '<details><summary>Full plan output</summary>',
-              '',
-              '```hcl',
-              body,
+              '```',
+              planBody,
               '```',
               '',
               '</details>',
-            ].join('\n');
+              '',
+              cta,
+            ];
 
+            const body = lines.join('\n');
             const { owner, repo } = context.repo;
             const issue_number = context.payload.pull_request.number;
 
@@ -466,11 +551,11 @@ jobs:
 
             if (existing) {
               await github.rest.issues.updateComment({
-                owner, repo, comment_id: existing.id, body: header,
+                owner, repo, comment_id: existing.id, body,
               });
             } else {
               await github.rest.issues.createComment({
-                owner, repo, issue_number, body: header,
+                owner, repo, issue_number, body,
               });
             }
 
