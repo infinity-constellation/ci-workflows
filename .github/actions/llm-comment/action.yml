@@ -215,6 +215,10 @@ runs:
 
         # ── Parse response ───────────────────────────────────────────────────
         RAW_CONTENT=$(echo "$RESPONSE" | jq -r '.choices[0].message.content // empty' 2>/dev/null || true)
+        echo "::debug::LLM response length: ${#RESPONSE}, raw_content length: ${#RAW_CONTENT}"
+        if [ -z "$RAW_CONTENT" ] && [ -n "$RESPONSE" ]; then
+          echo "::debug::LLM response body: $(echo "$RESPONSE" | head -c 500)"
+        fi
         if [ -z "$RAW_CONTENT" ]; then
           API_ERR=$(echo "$RESPONSE" | jq -r '.error.message // .message // "unknown"' 2>/dev/null || true)
           echo "::warning::LLM call failed (${API_ERR:-no response}) — falling back to static content"
