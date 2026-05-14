@@ -21,7 +21,7 @@ inputs:
   model:
     description: "OpenRouter model ID."
     required: false
-    default: "anthropic/claude-3.5-haiku"
+    default: "openai/gpt-4o-mini"
 
 outputs:
   display-name:
