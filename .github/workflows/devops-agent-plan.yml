@@ -106,6 +106,8 @@ jobs:
       engine: ${{ steps.detect.outputs.engine }}
       has-changes: ${{ steps.summarize.outputs.has_changes }}
       bootstrap: ${{ steps.resolve.outputs.bootstrap }}
+      env-name: ${{ steps.resolve.outputs.env_name }}
+      env-tier: ${{ steps.resolve.outputs.env_tier }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -196,6 +198,22 @@ jobs:
           # Final safety: hard-truncate to 64 chars in case run-id is unexpectedly long.
           ROLE_SESSION_NAME="${ROLE_SESSION_NAME:0:64}"
 
+          # Derive environment context from the stack directory path.
+          # Path structure: live/{bu}/{provider}/{env}/{region}/{service}
+          # or:             live/{bu}/{provider}/{service}  (no env = shared)
+          # Segments: 0=live, 1=bu, 2=provider, 3=env-or-service, 4=region-or-service, 5=service
+          DIR_PARTS=$(echo "$INPUT_WORKING_DIRECTORY" | tr '/' ' ')
+          PART3=$(echo "$DIR_PARTS" | awk '{print $4}')
+          PART4=$(echo "$DIR_PARTS" | awk '{print $5}')
+          # Classify environment: known env names at segment 3
+          case "$PART3" in
+            production|prod)    ENV_NAME="production";  ENV_TIER="production"  ;;
+            staging|stage)      ENV_NAME="staging";     ENV_TIER="non-production" ;;
+            shared-infrastructure|shared|management|shared_infrastructure) ENV_NAME="shared"; ENV_TIER="shared" ;;
+            *)                  ENV_NAME="shared";      ENV_TIER="shared" ;;
+          esac
+          BU_NAME=$(echo "$DIR_PARTS" | awk '{print $2}')
+
           {
             echo "stack_id=$STACK_ID"
             echo "aws_region=$AWS_REGION"
@@ -203,6 +221,9 @@ jobs:
             echo "plan_artifact=$PLAN_ARTIFACT"
             echo "role_session_name=$ROLE_SESSION_NAME"
             echo "bootstrap=$BOOTSTRAP"
+            echo "env_name=$ENV_NAME"
+            echo "env_tier=$ENV_TIER"
+            echo "bu_name=$BU_NAME"
           } >> "$GITHUB_OUTPUT"
 
       - name: Detect engine
@@ -398,7 +419,7 @@ jobs:
           # 3. Strip blank lines that result from removals
            PLAN_EXCERPT=$(cat "$PLAN_DIR/plan.txt" \
              | sed 's/^[0-9][0-9]:[0-9][0-9]:[0-9][0-9]\.[0-9]* STDOUT terraform: //' \
-             | grep -vE '^data\.[^[:space:]]+ .+:\s*(Reading\.\.\.|Read complete|Still reading|Refreshing state)' \
+             | grep -vE '^data\.[^:]+:\s*(Reading\.\.\.|Read complete|Still reading|Refreshing state)' \
              | grep -vE '^$' \
              | head -c 3000 || true)
           {
@@ -437,17 +458,20 @@ jobs:
           event-type: plan
           openrouter-api-key: ${{ secrets.OPENROUTER_API_KEY }}
           context-json: >-
-            {
-              "stack_id": "${{ steps.resolve.outputs.stack_id }}",
-              "engine": "${{ steps.detect.outputs.engine }}",
-              "adds": ${{ steps.summarize.outputs.adds }},
-              "changes": ${{ steps.summarize.outputs.changes }},
-              "destroys": ${{ steps.summarize.outputs.destroys }},
-              "replaces": ${{ steps.summarize.outputs.replaces }},
-              "is_destroy_mode": ${{ inputs.destroy }},
-              "resource_names": ${{ steps.summarize.outputs.resource_names || '[]' }},
-              "plan_excerpt": ${{ toJSON(steps.summarize.outputs.plan_excerpt) }}
-            }
+             {
+               "stack_id": "${{ steps.resolve.outputs.stack_id }}",
+               "engine": "${{ steps.detect.outputs.engine }}",
+               "environment": "${{ steps.resolve.outputs.env_name }}",
+               "environment_tier": "${{ steps.resolve.outputs.env_tier }}",
+               "business_unit": "${{ steps.resolve.outputs.bu_name }}",
+               "adds": ${{ steps.summarize.outputs.adds }},
+               "changes": ${{ steps.summarize.outputs.changes }},
+               "destroys": ${{ steps.summarize.outputs.destroys }},
+               "replaces": ${{ steps.summarize.outputs.replaces }},
+               "is_destroy_mode": ${{ inputs.destroy }},
+               "resource_names": ${{ steps.summarize.outputs.resource_names || '[]' }},
+               "plan_excerpt": ${{ toJSON(steps.summarize.outputs.plan_excerpt) }}
+             }
 
       - name: Upload plan artifact
         uses: actions/upload-artifact@v7
@@ -486,7 +510,7 @@ jobs:
             const cleanPlan = rawPlan
               .split('\n')
               .map(l => l.replace(/^\d{2}:\d{2}:\d{2}\.\d+ STDOUT terraform: /, ''))
-              .filter(l => !/^data\.[^\s]+ .+:\s*(Reading\.\.\.|Read complete|Still reading|Refreshing state)/.test(l.trim()))
+              .filter(l => !/^data\.[^:]+:\s*(Reading\.\.\.|Read complete|Still reading|Refreshing state)/.test(l.trim()))
               .join('\n')
               .trim();
 
