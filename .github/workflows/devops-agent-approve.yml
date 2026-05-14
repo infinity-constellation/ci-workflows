@@ -276,6 +276,8 @@ jobs:
         if: steps.filter.outputs.proceed == 'true' && steps.dispatch.outputs.dispatched == 'true'
         uses: actions/github-script@v9
         env:
+          APPROVER: ${{ github.event.review.user.login }}
+          STACKS_JSON: ${{ inputs.stacks }}
           LLM_DISPLAY_NAME: ${{ steps.llm.outputs.display_name }}
           LLM_SUMMARY: ${{ steps.llm.outputs.summary }}
           LLM_DETAILS: ${{ steps.llm.outputs.details }}
@@ -283,27 +285,42 @@ jobs:
         with:
           github-token: ${{ steps.app-token.outputs.token }}
           script: |
-            const marker     = `<!-- devops-agent-approval-${process.env.APPROVER} -->`;
+            const approver   = process.env.APPROVER || 'unknown';
+            const marker     = `<!-- devops-agent-apply-queued -->`;
             const llmDisplay = process.env.LLM_DISPLAY_NAME || '';
             const llmSummary = process.env.LLM_SUMMARY      || '';
             const llmDetails = process.env.LLM_DETAILS      || '';
             const llmCta     = process.env.LLM_CTA          || 'Apply is running in dependency order. The PR will auto-merge on success.';
 
+            function toDisplayId(id) {
+              return (id || '')
+                .replace(/^live-/, '')
+                .replace(/^(infinity|labrynth)-aws-/, '')
+                .replace(/-(us-east-[12]|us-west-2|eu-west-1)-/g, ' · ')
+                .replace(/-/g, ' · ');
+            }
+
             const stacks = JSON.parse(process.env.STACKS_JSON || '[]').map(s => s.stack_id);
-            function shortId(id) { return (id||'').split('-').slice(-3).join('-') || id; }
+
+            const heading = llmDisplay
+              ? `#### Applied — ${llmDisplay}`
+              : `#### Apply queued`;
 
             const lines = [
               marker,
-              llmDisplay
-                ? `#### Apply queued — ${llmDisplay}`
-                : `#### Apply queued — approved by @${process.env.APPROVER}`,
+              heading,
               '',
-              `Approved by @${process.env.APPROVER}`,
-              '',
-              stacks.map(s => `- \`${shortId(s)}\``).join('\n'),
+              `Approved by @${approver} · [run](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions)`,
             ];
+
             if (llmSummary) { lines.push('', llmSummary); }
             if (llmDetails) { lines.push('', llmDetails); }
+
+            if (stacks.length > 0) {
+              lines.push('', '**Stacks in apply order:**');
+              stacks.forEach(s => lines.push(`- \`${toDisplayId(s)}\``));
+            }
+
             lines.push('', `> ${llmCta}`);
 
             const body = lines.join('\n');
