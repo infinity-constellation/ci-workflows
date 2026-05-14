@@ -1,0 +1,118 @@
+name: gravity-devops-agent — evaluate
+
+# Reusable workflow: called immediately after discover, before the plan matrix.
+# Posts an initial lifecycle comment on the PR so engineers see immediate feedback.
+# The plan workflow finds this comment (by marker) and updates it in-place.
+
+on:
+  workflow_call:
+    inputs:
+      stacks:
+        description: "JSON array of stack descriptors from discover."
+        required: true
+        type: string
+      pr-title:
+        description: "PR title."
+        required: false
+        type: string
+        default: ""
+      pr-author:
+        description: "PR author login."
+        required: false
+        type: string
+        default: ""
+    outputs:
+      comment-id:
+        description: "ID of the posted lifecycle comment (for subsequent updates)."
+        value: ${{ jobs.evaluate.outputs.comment_id }}
+
+permissions:
+  pull-requests: write
+  contents: read
+
+jobs:
+  evaluate:
+    runs-on: ubuntu-latest
+    outputs:
+      comment_id: ${{ steps.post.outputs.comment_id }}
+    steps:
+      - name: Generate gravity-devops-agent token
+        id: app-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.GRAVITY_DEVOPS_AGENT_APP_ID }}
+          private-key: ${{ secrets.GRAVITY_DEVOPS_AGENT_PRIVATE_KEY }}
+
+      - name: Call LLM for opening message
+        id: llm
+        uses: infinity-constellation/ci-workflows/.github/actions/llm-comment@main
+        with:
+          event-type: comment-evaluate
+          openrouter-api-key: ${{ secrets.OPENROUTER_API_KEY }}
+          context-json: >-
+            {
+              "pr_title": "${{ inputs.pr-title }}",
+              "author": "${{ inputs.pr-author }}",
+              "stacks": ${{ inputs.stacks }},
+              "stack_count": ${{ fromJson(inputs.stacks) != null && toJSON(fromJson(inputs.stacks)) || '[]' }}
+            }
+
+      - name: Post initial lifecycle comment
+        id: post
+        uses: actions/github-script@v9
+        with:
+          github-token: ${{ steps.app-token.outputs.token }}
+          script: |
+            const marker   = `<!-- devops-agent-pr:${context.payload.pull_request.number} -->`;
+            const llmMsg   = process.env.LLM_DETAILS || '';
+            const stacks   = JSON.parse(process.env.STACKS_JSON || '[]');
+
+            function toDisplayId(id) {
+              return id
+                .replace(/^live-/, '')
+                .replace(/^(infinity|labrynth)-aws-/, '')
+                .replace(/-(us-east-[12]|us-west-2|eu-west-1)-/g, '-')
+                .replace(/-/, ' · ');
+            }
+
+            const stackList = stacks.map(s => `- \`${toDisplayId(s.stack_id)}\``).join('\n');
+
+            const body = [
+              marker,
+              llmMsg || `Reviewing this PR — planning ${stacks.length} stack${stacks.length === 1 ? '' : 's'}...`,
+              '',
+              `**Stacks in scope:**`,
+              stackList,
+              '',
+              `_Plan results will appear here when complete._`,
+            ].join('\n');
+
+            const { owner, repo } = context.repo;
+            const issue_number = context.payload.pull_request.number;
+
+            // Check if a lifecycle comment already exists (re-run case)
+            const { data: comments } = await github.rest.issues.listComments({
+              owner, repo, issue_number, per_page: 100,
+            });
+            const existing = comments.find(c =>
+              c.user?.type === 'Bot' && c.body?.includes(marker)
+            );
+
+            let comment_id;
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner, repo, comment_id: existing.id, body,
+              });
+              comment_id = existing.id;
+            } else {
+              const { data: created } = await github.rest.issues.createComment({
+                owner, repo, issue_number, body,
+              });
+              comment_id = created.id;
+            }
+
+            core.setOutput('comment_id', String(comment_id));
+            core.info(`Lifecycle comment posted/updated: ${comment_id}`);
+        env:
+          LLM_DETAILS: ${{ steps.llm.outputs.details }}
+          STACKS_JSON: ${{ inputs.stacks }}
