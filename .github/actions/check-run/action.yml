@@ -1,0 +1,109 @@
+name: Gravity check run
+description: |
+  Creates or updates a GitHub Check Run under the gravity-devops-agent App identity,
+  so the App's avatar appears on the PR status checks list instead of the generic
+  GitHub Actions logo.
+
+  Usage — pair two calls per job:
+    1. At job start with status=in_progress (no conclusion)
+    2. At job end with if: always() and status=completed + conclusion from job outcome
+
+inputs:
+  app-token:
+    description: "Installation token from the gravity-devops-agent App."
+    required: true
+  name:
+    description: "Check run name as it appears in the PR checks list."
+    required: true
+  head-sha:
+    description: "Commit SHA to attach the check run to."
+    required: true
+  status:
+    description: "Check run status: queued | in_progress | completed"
+    required: true
+  conclusion:
+    description: "Required when status=completed. One of: success | failure | neutral | cancelled | skipped | timed_out | action_required"
+    required: false
+    default: ""
+  title:
+    description: "Short title shown in the check run detail view."
+    required: false
+    default: ""
+  summary:
+    description: "Markdown summary shown in the check run detail view."
+    required: false
+    default: ""
+  check-run-id:
+    description: "Existing check run ID to update (omit to create new)."
+    required: false
+    default: ""
+
+outputs:
+  check-run-id:
+    description: "The check run ID — pass to subsequent calls to update the same run."
+    value: ${{ steps.upsert.outputs.check_run_id }}
+
+runs:
+  using: composite
+  steps:
+    - name: Create or update check run
+      id: upsert
+      continue-on-error: true
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.app-token }}
+        REPO: ${{ github.repository }}
+        NAME: ${{ inputs.name }}
+        HEAD_SHA: ${{ inputs.head-sha }}
+        STATUS: ${{ inputs.status }}
+        CONCLUSION: ${{ inputs.conclusion }}
+        TITLE: ${{ inputs.title }}
+        SUMMARY: ${{ inputs.summary }}
+        CHECK_RUN_ID: ${{ inputs.check-run-id }}
+      run: |
+        set -euo pipefail
+
+        TITLE="${TITLE:-$NAME}"
+        SUMMARY="${SUMMARY:-}"
+
+        if [ -n "$CHECK_RUN_ID" ]; then
+          # ── Update existing check run ──────────────────────────────────
+          PAYLOAD=$(jq -n \
+            --arg name "$NAME" \
+            --arg status "$STATUS" \
+            --arg conclusion "$CONCLUSION" \
+            --arg title "$TITLE" \
+            --arg summary "$SUMMARY" \
+            '{
+              name: $name,
+              status: $status,
+              output: {title: $title, summary: $summary}
+            } + (if $status == "completed" then {conclusion: $conclusion, completed_at: (now | strftime("%Y-%m-%dT%H:%M:%SZ"))} else {} end)')
+
+          RESULT=$(gh api "repos/$REPO/check-runs/$CHECK_RUN_ID" \
+            --method PATCH \
+            --input - <<< "$PAYLOAD")
+          echo "check_run_id=$CHECK_RUN_ID" >> "$GITHUB_OUTPUT"
+        else
+          # ── Create new check run ───────────────────────────────────────
+          PAYLOAD=$(jq -n \
+            --arg name "$NAME" \
+            --arg sha "$HEAD_SHA" \
+            --arg status "$STATUS" \
+            --arg conclusion "$CONCLUSION" \
+            --arg title "$TITLE" \
+            --arg summary "$SUMMARY" \
+            '{
+              name: $name,
+              head_sha: $sha,
+              status: $status,
+              started_at: (now | strftime("%Y-%m-%dT%H:%M:%SZ")),
+              output: {title: $title, summary: $summary}
+            } + (if $status == "completed" then {conclusion: $conclusion, completed_at: (now | strftime("%Y-%m-%dT%H:%M:%SZ"))} else {} end)')
+
+          RESULT=$(gh api "repos/$REPO/check-runs" \
+            --method POST \
+            --input - <<< "$PAYLOAD")
+          ID=$(echo "$RESULT" | jq -r '.id')
+          echo "check_run_id=$ID" >> "$GITHUB_OUTPUT"
+        fi

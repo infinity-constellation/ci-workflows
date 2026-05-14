@@ -21,7 +21,7 @@ inputs:
   model:
     description: "OpenRouter model ID."
     required: false
-    default: "anthropic/claude-haiku-3.5"
+    default: "anthropic/claude-3.5-haiku"
 
 outputs:
   display-name:
@@ -192,7 +192,7 @@ runs:
           }')
 
         # ── Call OpenRouter ──────────────────────────────────────────────────
-        RESPONSE=$(curl -sf \
+        RESPONSE=$(curl -s \
           --max-time 20 \
           -H "Authorization: Bearer $OPENROUTER_API_KEY" \
           -H "Content-Type: application/json" \
@@ -201,9 +201,10 @@ runs:
           https://openrouter.ai/api/v1/chat/completions)
 
         # ── Parse response ───────────────────────────────────────────────────
-        RAW_CONTENT=$(echo "$RESPONSE" | jq -r '.choices[0].message.content // empty')
+        RAW_CONTENT=$(echo "$RESPONSE" | jq -r '.choices[0].message.content // empty' 2>/dev/null || true)
         if [ -z "$RAW_CONTENT" ]; then
-          echo "::warning::LLM response was empty or malformed — falling back to static content"
+          API_ERR=$(echo "$RESPONSE" | jq -r '.error.message // .message // "unknown error"' 2>/dev/null || true)
+          echo "::warning::LLM call failed (${API_ERR:-no response}) — falling back to static content"
           echo "display_name=" >> "$GITHUB_OUTPUT"
           echo "summary="      >> "$GITHUB_OUTPUT"
           echo "cta="          >> "$GITHUB_OUTPUT"
