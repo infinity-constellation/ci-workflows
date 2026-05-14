@@ -34,6 +34,27 @@ name: gravity-devops-agent — respond
 
 on:
   workflow_call:
+    inputs:
+      pr-number:
+        description: "PR number the comment was posted on."
+        required: true
+        type: number
+      comment-body:
+        description: "Body of the comment that triggered the workflow."
+        required: true
+        type: string
+      comment-author:
+        description: "GitHub login of the comment author."
+        required: true
+        type: string
+      comment-id:
+        description: "ID of the comment (for reactions)."
+        required: true
+        type: string
+      repo:
+        description: "Repository in owner/name format."
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -60,10 +81,10 @@ jobs:
         id: context
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
-          REPO: ${{ github.repository }}
-          PR_NUMBER: ${{ github.event.issue.number }}
-          COMMENT_BODY: ${{ github.event.comment.body }}
-          COMMENT_AUTHOR: ${{ github.event.comment.user.login }}
+          REPO: ${{ inputs.repo }}
+          PR_NUMBER: ${{ inputs.pr-number }}
+          COMMENT_BODY: ${{ inputs.comment-body }}
+          COMMENT_AUTHOR: ${{ inputs.comment-author }}
         run: |
           set -euo pipefail
 
@@ -114,21 +135,25 @@ jobs:
           echo "__PC_EOF__"                 >> "$GITHUB_OUTPUT"
 
       - name: Post thinking reaction
+        id: reaction
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
-          REPO: ${{ github.repository }}
-          COMMENT_ID: ${{ github.event.comment.id }}
+          REPO: ${{ inputs.repo }}
+          COMMENT_ID: ${{ inputs.comment-id }}
         run: |
-          # Add a 🤔 reaction to signal we received the message and are working on it.
-          gh api "repos/$REPO/issues/comments/$COMMENT_ID/reactions" \
+          # Add 👀 to signal we received the message and are processing.
+          # Store the reaction ID so we can delete it cleanly after responding.
+          REACTION=$(gh api "repos/$REPO/issues/comments/$COMMENT_ID/reactions" \
             --method POST \
-            --field content="eyes" 2>/dev/null || true
+            --field content="eyes" 2>/dev/null || echo "{}")
+          REACTION_ID=$(echo "$REACTION" | jq -r '.id // ""')
+          echo "reaction_id=$REACTION_ID" >> "$GITHUB_OUTPUT"
 
       - name: Trigger re-plan if requested
         if: steps.context.outputs.wants_replan == 'true'
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
-          REPO: ${{ github.repository }}
+          REPO: ${{ inputs.repo }}
           HEAD_REF: ${{ fromJson(steps.context.outputs.pr_json).head_ref }}
         run: |
           set -euo pipefail
@@ -147,7 +172,7 @@ jobs:
             {
               "question": ${{ toJSON(steps.context.outputs.question) }},
               "pr_context": ${{ steps.context.outputs.pr_json }},
-              "comment_author": "${{ github.event.comment.user.login }}",
+              "comment_author": "${{ inputs.comment-author }}",
               "wants_replan": ${{ steps.context.outputs.wants_replan }},
               "plan_comments": ${{ steps.context.outputs.plan_comments }}
             }
@@ -155,9 +180,9 @@ jobs:
       - name: Post response comment
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
-          REPO: ${{ github.repository }}
-          PR_NUMBER: ${{ github.event.issue.number }}
-          COMMENT_AUTHOR: ${{ github.event.comment.user.login }}
+          REPO: ${{ inputs.repo }}
+          PR_NUMBER: ${{ inputs.pr-number }}
+          COMMENT_AUTHOR: ${{ inputs.comment-author }}
           WANTS_REPLAN: ${{ steps.context.outputs.wants_replan }}
           LLM_DIAGNOSIS: ${{ steps.llm.outputs.diagnosis }}
           LLM_FIX: ${{ steps.llm.outputs.fix }}
@@ -189,18 +214,13 @@ jobs:
         if: always()
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
-          REPO: ${{ github.repository }}
-          COMMENT_ID: ${{ github.event.comment.id }}
+          REPO: ${{ inputs.repo }}
+          COMMENT_ID: ${{ inputs.comment-id }}
+          REACTION_ID: ${{ steps.reaction.outputs.reaction_id }}
         run: |
-          # Replace the 👀 reaction with ✅ to signal completion.
-          # First find and delete the eyes reaction we added, then add rocket.
-          REACTION_ID=$(gh api "repos/$REPO/issues/comments/$COMMENT_ID/reactions" \
-            --jq '.[] | select(.content == "eyes" and .user.type == "Bot") | .id' \
-            2>/dev/null || echo "")
+          # Remove the 👀 reaction now that we've responded (or failed).
+          # No replacement reaction — clean slate, no noise.
           if [ -n "$REACTION_ID" ]; then
             gh api "repos/$REPO/issues/comments/$COMMENT_ID/reactions/$REACTION_ID" \
               --method DELETE 2>/dev/null || true
           fi
-          gh api "repos/$REPO/issues/comments/$COMMENT_ID/reactions" \
-            --method POST \
-            --field content="rocket" 2>/dev/null || true
