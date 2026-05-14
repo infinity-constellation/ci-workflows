@@ -519,38 +519,54 @@ jobs:
           github-token: ${{ steps.app-token.outputs.token }}
           script: |
             const marker = `<!-- devops-agent-apply -->`;
-            const applied = JSON.parse(process.env.APPLIED_JSON || '[]');
-            const stacks = JSON.parse(process.env.STACKS_JSON || '[]');
-            const failed = process.env.FAILED_STACK;
-            const outcome = process.env.OUTCOME;
+            const applied  = JSON.parse(process.env.APPLIED_JSON || '[]');
+            const stacks   = JSON.parse(process.env.STACKS_JSON  || '[]');
+            const failed   = process.env.FAILED_STACK;
+            const outcome  = process.env.OUTCOME;
+            const approver = process.env.APPROVER_LOGIN;
+            const runUrl   = process.env.RUN_URL;
 
-            const appliedList = applied.map(s => `- ✅ \`${s}\``).join('\n') || '_none_';
+            // Derive short display IDs from full stack IDs (mirrors plan workflow logic)
+            function toDisplayId(id) {
+              return id
+                .replace(/^live-/, '')
+                .replace(/^(infinity|labrynth)-aws-/, '')
+                .replace(/-(us-east-[12]|us-west-2|eu-west-1)-/g, '-')
+                .replace(/-/, ' · ');
+            }
+
             const skipped = stacks
               .map(s => s.stack_id)
               .filter(id => !applied.includes(id) && id !== failed);
-            const skippedList = skipped.length > 0 ? skipped.map(s => `- ⏭️ \`${s}\``).join('\n') : '';
 
-            const lines = [
-              marker,
-              outcome === 'success'
-                ? `### gravity-devops-agent — Apply succeeded ✅`
-                : `### gravity-devops-agent — Apply FAILED ❌`,
-              '',
-              `Approver: @${process.env.APPROVER_LOGIN}  ·  [workflow run](${process.env.RUN_URL})`,
-              '',
-              `**Applied:**`,
-              appliedList,
-            ];
-            if (failed) {
-              lines.push('', `**Failed stack:** \`${failed}\``);
-            }
-            if (skippedList) {
-              lines.push('', `**Skipped (downstream of failure):**`, skippedList);
-            }
+            const lines = [marker];
+
             if (outcome === 'success') {
-              lines.push('', `Auto-merge will engage once branch protection requirements are satisfied.`);
+              lines.push(`#### Applied — ${applied.map(toDisplayId).join(', ')}`);
+              lines.push('');
+              lines.push(`Approved by @${approver} · [run](${runUrl})`);
+              if (applied.length > 0) {
+                lines.push('');
+                lines.push(applied.map(s => `- ✅ \`${toDisplayId(s)}\``).join('\n'));
+              }
             } else {
-              lines.push('', `Approvals will be dismissed and a postmortem comment posted shortly.`);
+              lines.push(`#### Apply failed — \`${toDisplayId(failed)}\``);
+              lines.push('');
+              lines.push(`Approved by @${approver} · [run](${runUrl})`);
+              lines.push('');
+              if (applied.length > 0) {
+                lines.push('**Applied before failure:**');
+                lines.push(applied.map(s => `- ✅ \`${toDisplayId(s)}\``).join('\n'));
+                lines.push('');
+              }
+              lines.push(`**Failed:** \`${toDisplayId(failed)}\``);
+              if (skipped.length > 0) {
+                lines.push('');
+                lines.push('**Skipped (downstream of failure):**');
+                lines.push(skipped.map(s => `- ⏭️ \`${toDisplayId(s)}\``).join('\n'));
+              }
+              lines.push('');
+              lines.push('> Approvals have been dismissed. A postmortem comment will follow.');
             }
 
             const body = lines.join('\n');
@@ -709,19 +725,13 @@ jobs:
             const marker = `<!-- devops-agent-merge-failed -->`;
             const body = [
               marker,
-              `### gravity-devops-agent — Auto-merge could not engage ⚠️`,
+              `#### Infrastructure applied — merge required`,
               '',
-              `**Apply succeeded** — infrastructure is changed and reflects the reviewed plan. Approvals on this PR remain valid.`,
+              `Apply succeeded and infrastructure reflects the approved plan, but auto-merge could not engage.`,
               '',
-              `Auto-merge failed for every allowed method on this repo. Likely causes:`,
+              `**Merge this PR manually** using any method your repo allows. The change is already live; merging just records it on \`main\`.`,
               '',
-              `- The repo has no merge methods enabled (enable at least one of squash / rebase / merge in repo settings).`,
-              `- The repo silently disabled the configured method between approval and merge.`,
-              `- Branch protection requires a check that has not yet completed.`,
-              '',
-              `**Action:** merge this PR manually using whichever method your repo allows. The change is already applied; merging just records the PR in \`main\`. Then close out this notice.`,
-              '',
-              `<details><summary>Last error</summary>`,
+              `<details><summary>Error detail</summary>`,
               '',
               '```',
               process.env.MERGE_ERROR || '(no error captured)',
