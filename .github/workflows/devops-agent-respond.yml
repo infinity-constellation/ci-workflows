@@ -185,12 +185,16 @@ jobs:
           COMMENT_AUTHOR: ${{ inputs.comment-author }}
           WANTS_REPLAN: ${{ steps.context.outputs.wants_replan }}
           LLM_DIAGNOSIS: ${{ steps.llm.outputs.diagnosis }}
+          LLM_DETAILS: ${{ steps.llm.outputs.details }}
+          LLM_SUMMARY: ${{ steps.llm.outputs.summary }}
           LLM_FIX: ${{ steps.llm.outputs.fix }}
           LLM_DISPLAY: ${{ steps.llm.outputs.display_name }}
         run: |
           set -euo pipefail
 
-          RESPONSE="${LLM_DIAGNOSIS}"
+          # Use diagnosis as primary (comment-question answer), fall back to
+          # details then summary if the LLM put the answer in a different field.
+          RESPONSE="${LLM_DIAGNOSIS:-${LLM_DETAILS:-${LLM_SUMMARY:-}}}"
           if [ -n "$LLM_FIX" ]; then
             RESPONSE="${RESPONSE}"$'\n\n'"${LLM_FIX}"
           fi
