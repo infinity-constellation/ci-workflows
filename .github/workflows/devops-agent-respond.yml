@@ -1,0 +1,195 @@
+name: gravity-devops-agent — respond
+
+# Reusable workflow: called by a thin caller in each portco repo when
+# someone mentions @gravity-devops-agent in a PR comment.
+# The agent gathers context, calls the LLM, and replies in the thread.
+#
+# Supported interactions (intent detected by LLM, not keyword matching):
+#   @gravity-devops-agent what does this plan change?
+#   @gravity-devops-agent why did the apply fail?
+#   @gravity-devops-agent is it safe to approve this?
+#   @gravity-devops-agent re-run the plan
+#   @gravity-devops-agent explain <anything about the PR>
+#
+# Caller: add a respond.yml to .github/workflows/ with:
+#   on:
+#     issue_comment:
+#       types: [created]
+#   jobs:
+#     respond:
+#       if: |
+#         github.event.issue.pull_request != null &&
+#         contains(github.event.comment.body, '@gravity-devops-agent') &&
+#         github.event.issue.state == 'open' &&
+#         github.event.comment.user.type != 'Bot'
+#       uses: infinity-constellation/ci-workflows/.github/workflows/devops-agent-respond.yml@main
+#       secrets: inherit
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+  actions: write   # needed to trigger re-plan workflow_dispatch
+
+jobs:
+  respond:
+    # Only fire on PR comments (not issue comments) that mention the agent.
+    if: |
+      github.event.issue.pull_request != null &&
+      contains(github.event.comment.body, '@gravity-devops-agent') &&
+      github.event.issue.state == 'open' &&
+      github.event.comment.user.type != 'Bot'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate gravity-devops-agent token
+        id: app-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.GRAVITY_DEVOPS_AGENT_APP_ID }}
+          private-key: ${{ secrets.GRAVITY_DEVOPS_AGENT_PRIVATE_KEY }}
+
+      - name: Gather PR context
+        id: context
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
+          COMMENT_AUTHOR: ${{ github.event.comment.user.login }}
+        run: |
+          set -euo pipefail
+
+          # Strip the @mention to get the raw question.
+          QUESTION=$(echo "$COMMENT_BODY" | sed 's/@gravity-devops-agent//g' | xargs)
+          echo "question<<__Q_EOF__"  >> "$GITHUB_OUTPUT"
+          echo "$QUESTION"            >> "$GITHUB_OUTPUT"
+          echo "__Q_EOF__"            >> "$GITHUB_OUTPUT"
+
+          # Detect re-run intent (simple keyword match — LLM handles nuance).
+          if echo "$QUESTION" | grep -qiE 're.?run|re.?plan|run again|replan|re plan'; then
+            echo "wants_replan=true"  >> "$GITHUB_OUTPUT"
+          else
+            echo "wants_replan=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          # Fetch PR metadata.
+          PR_JSON=$(gh api "repos/$REPO/pulls/$PR_NUMBER" \
+            --jq '{title: .title, head_ref: .head.ref, head_sha: .head.sha, author: .user.login, base: .base.ref}')
+          echo "pr_json=$PR_JSON" >> "$GITHUB_OUTPUT"
+
+          # Find the most recent successful plan run for this PR branch.
+          HEAD_REF=$(echo "$PR_JSON" | jq -r '.head_ref')
+          HEAD_SHA=$(echo "$PR_JSON" | jq -r '.head_sha')
+
+          PLAN_RUN_ID=$(gh run list \
+            --repo "$REPO" \
+            --workflow infra.yml \
+            --branch "$HEAD_REF" \
+            --status success \
+            --limit 3 \
+            --json databaseId,headSha \
+            --jq "[.[] | select(.headSha == \"$HEAD_SHA\")] | .[0].databaseId" 2>/dev/null || echo "")
+
+          echo "plan_run_id=${PLAN_RUN_ID:-}" >> "$GITHUB_OUTPUT"
+
+          # Collect plan comments already on the PR to give the LLM context.
+          PLAN_COMMENTS=$(gh api "repos/$REPO/issues/$PR_NUMBER/comments" \
+            --jq '[.[] | select(.user.type == "Bot" and (.body | contains("devops-agent-plan:"))) | {body: .body[:3000]}] | .[:5]' \
+            2>/dev/null || echo '[]')
+          echo "plan_comments<<__PC_EOF__"  >> "$GITHUB_OUTPUT"
+          echo "$PLAN_COMMENTS"             >> "$GITHUB_OUTPUT"
+          echo "__PC_EOF__"                 >> "$GITHUB_OUTPUT"
+
+      - name: Post thinking reaction
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          REPO: ${{ github.repository }}
+          COMMENT_ID: ${{ github.event.comment.id }}
+        run: |
+          # Add a 🤔 reaction to signal we received the message and are working on it.
+          gh api "repos/$REPO/issues/comments/$COMMENT_ID/reactions" \
+            --method POST \
+            --field content="eyes" 2>/dev/null || true
+
+      - name: Trigger re-plan if requested
+        if: steps.context.outputs.wants_replan == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          REPO: ${{ github.repository }}
+          HEAD_REF: ${{ fromJson(steps.context.outputs.pr_json).head_ref }}
+        run: |
+          set -euo pipefail
+          gh workflow run infra.yml \
+            --repo "$REPO" \
+            --ref "$HEAD_REF" \
+            2>&1 && echo "Re-plan triggered on $HEAD_REF" || true
+
+      - name: Call LLM for response
+        id: llm
+        uses: infinity-constellation/ci-workflows/.github/actions/llm-comment@main
+        with:
+          event-type: comment-question
+          openrouter-api-key: ${{ secrets.OPENROUTER_API_KEY }}
+          context-json: >-
+            {
+              "question": ${{ toJSON(steps.context.outputs.question) }},
+              "pr_context": ${{ steps.context.outputs.pr_json }},
+              "comment_author": "${{ github.event.comment.user.login }}",
+              "wants_replan": ${{ steps.context.outputs.wants_replan }},
+              "plan_comments": ${{ steps.context.outputs.plan_comments }}
+            }
+
+      - name: Post response comment
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+          COMMENT_AUTHOR: ${{ github.event.comment.user.login }}
+          WANTS_REPLAN: ${{ steps.context.outputs.wants_replan }}
+          LLM_DIAGNOSIS: ${{ steps.llm.outputs.diagnosis }}
+          LLM_FIX: ${{ steps.llm.outputs.fix }}
+          LLM_DISPLAY: ${{ steps.llm.outputs.display_name }}
+        run: |
+          set -euo pipefail
+
+          RESPONSE="${LLM_DIAGNOSIS}"
+          if [ -n "$LLM_FIX" ]; then
+            RESPONSE="${RESPONSE}"$'\n\n'"${LLM_FIX}"
+          fi
+          if [ -z "$RESPONSE" ]; then
+            RESPONSE="I wasn't able to generate a useful response for that question. Check the plan output in this PR or the workflow run logs for details."
+          fi
+
+          # Prepend replan notice if triggered.
+          if [ "$WANTS_REPLAN" = "true" ]; then
+            RESPONSE="Re-plan triggered on this branch — a new plan comment will appear shortly."$'\n\n'"${RESPONSE}"
+          fi
+
+          BODY="@${COMMENT_AUTHOR} ${RESPONSE}"
+
+          gh api "repos/$REPO/issues/$PR_NUMBER/comments" \
+            --method POST \
+            --field body="$BODY"
+
+      - name: Remove thinking reaction
+        if: always()
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          REPO: ${{ github.repository }}
+          COMMENT_ID: ${{ github.event.comment.id }}
+        run: |
+          # Replace the 👀 reaction with ✅ to signal completion.
+          # First find and delete the eyes reaction we added, then add rocket.
+          REACTION_ID=$(gh api "repos/$REPO/issues/comments/$COMMENT_ID/reactions" \
+            --jq '.[] | select(.content == "eyes" and .user.type == "Bot") | .id' \
+            2>/dev/null || echo "")
+          if [ -n "$REACTION_ID" ]; then
+            gh api "repos/$REPO/issues/comments/$COMMENT_ID/reactions/$REACTION_ID" \
+              --method DELETE 2>/dev/null || true
+          fi
+          gh api "repos/$REPO/issues/comments/$COMMENT_ID/reactions" \
+            --method POST \
+            --field content="rocket" 2>/dev/null || true

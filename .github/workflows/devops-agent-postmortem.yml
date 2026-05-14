@@ -151,51 +151,29 @@ jobs:
 
           echo "tail_file=$RUNNER_TEMP/postmortem/tail.txt" >> "$GITHUB_OUTPUT"
 
-      - name: Classify error and build suggestions
-        id: classify
-        env:
-          TAIL_FILE: ${{ steps.fetch.outputs.tail_file }}
-        run: |
-          set -euo pipefail
-          TAIL=$(cat "$TAIL_FILE")
-          # Static dispatch on known error signatures. Order matters:
-          # more specific first.
-          CATEGORY="unknown"
-          SUGGESTION=""
-
-          if echo "$TAIL" | grep -qiE 'ConditionalCheckFailedException.*tflock|Error acquiring the state lock|Lock Info'; then
-            CATEGORY="state-lock"
-            SUGGESTION="A DynamoDB state lock is held — usually a previous apply that crashed without releasing. Verify nothing is currently applying this stack, then run \`terragrunt force-unlock <LOCK_ID>\` from a privileged session. The lock ID is shown in the error tail."
-          elif echo "$TAIL" | grep -qiE 'Error.*Throttling|RequestLimitExceeded|TooManyRequestsException'; then
-            CATEGORY="aws-throttle"
-            SUGGESTION="AWS API throttling. Re-run the failed apply via the workflow run page (Re-run failed jobs). If it persists, batch the change into a smaller PR."
-          elif echo "$TAIL" | grep -qiE '403.*Forbidden|AccessDenied|not authorized to perform'; then
-            CATEGORY="iam-denied"
-            SUGGESTION="The apply role lacks permission for an action in this plan. Check the failing IAM action against the role's policy and the explicit Deny statements in InfraPlanAccess / github-action-tf-apply. If a new permission is needed, open a separate PR to grant it; do not retry until the role is updated."
-          elif echo "$TAIL" | grep -qiE 'Conftest|policy violation|denied by policy'; then
-            CATEGORY="opa-deny"
-            SUGGESTION="Conftest/OPA denied this plan. The policy rule should be in the comment thread; address the violation in code or, if it's a false positive, open a separate PR against the policy bundle."
-          elif echo "$TAIL" | grep -qiE 'Error.*ResourceNotFoundException|does not exist|NoSuchEntity'; then
-            CATEGORY="drift"
-            SUGGESTION="A resource Terraform expected to exist is missing — likely state drift. Inspect the resource manually; if it was deleted out-of-band, \`terraform state rm <addr>\` from a break-glass session and re-plan."
-          elif echo "$TAIL" | grep -qiE 'plan is stale|saved plan is stale'; then
-            CATEGORY="stale-plan"
-            SUGGESTION="The saved plan no longer matches state (someone else applied since the plan was generated). Push an empty commit to retrigger the plan; the new plan will be against current state."
-          elif echo "$TAIL" | grep -qiE 'context deadline exceeded|timeout|i/o timeout'; then
-            CATEGORY="timeout"
-            SUGGESTION="Operation timed out (often a long AWS resource creation, e.g. RDS or EKS). Re-run via the workflow page; the resource may have been created in the background and a re-plan will be a no-op or a short tail."
-          else
-            CATEGORY="unknown"
-            SUGGESTION="No matching pattern in the static playbook. Read the error tail below carefully. If this becomes a recurring failure mode, add a classifier branch to devops-agent-postmortem.yml."
-          fi
-
+          # Emit content as an output too (truncated to 4000 chars for LLM context).
+          TAIL_CONTENT=$(cat "$RUNNER_TEMP/postmortem/tail.txt" | head -c 4000 || true)
           {
-            echo "category=$CATEGORY"
-            # Multiline suggestion: emit using delimiter syntax.
-            echo "suggestion<<EOF"
-            echo "$SUGGESTION"
-            echo "EOF"
+            echo "tail_content<<__TAIL_EOF__"
+            echo "$TAIL_CONTENT"
+            echo "__TAIL_EOF__"
           } >> "$GITHUB_OUTPUT"
+
+      - name: Enrich with LLM
+        id: llm
+        uses: infinity-constellation/ci-workflows/.github/actions/llm-comment@main
+        with:
+          event-type: apply-failure
+          openrouter-api-key: ${{ secrets.OPENROUTER_API_KEY }}
+          context-json: >-
+            {
+              "failed_stack": "${{ inputs.failed-stack }}",
+              "applied_stacks": ${{ inputs.applied-stacks || '[]' }},
+              "approver": "${{ inputs.approver-login }}",
+              "pr_number": ${{ inputs.pr-number }},
+              "apply_run_id": "${{ inputs.apply-run-id }}",
+              "error_log": ${{ toJSON(steps.fetch.outputs.tail_content) }}
+            }
 
       - name: Post structured postmortem comment
         uses: actions/github-script@v9
@@ -208,54 +186,50 @@ jobs:
           APPLY_RUN_ID: ${{ inputs.apply-run-id }}
           REPO: ${{ github.repository }}
           SERVER_URL: ${{ github.server_url }}
-          CATEGORY: ${{ steps.classify.outputs.category }}
-          SUGGESTION: ${{ steps.classify.outputs.suggestion }}
           TAIL_FILE: ${{ steps.fetch.outputs.tail_file }}
+          LLM_DISPLAY_NAME: ${{ steps.llm.outputs.display_name }}
+          LLM_SUMMARY: ${{ steps.llm.outputs.summary }}
+          LLM_CTA: ${{ steps.llm.outputs.cta }}
+          LLM_DIAGNOSIS: ${{ steps.llm.outputs.diagnosis }}
+          LLM_FIX: ${{ steps.llm.outputs.fix }}
         with:
           github-token: ${{ steps.app-token.outputs.token }}
           script: |
-            const fs = require('fs');
-            const marker  = `<!-- devops-agent-postmortem -->`;
-            const failed  = process.env.FAILED_STACK;
-            const applied = JSON.parse(process.env.APPLIED_JSON || '[]');
-            const stacks  = JSON.parse(process.env.STACKS_JSON  || '[]').map(s => s.stack_id);
-            const skipped = stacks.filter(s => !applied.includes(s) && s !== failed);
-            const runUrl  = `${process.env.SERVER_URL}/${process.env.REPO}/actions/runs/${process.env.APPLY_RUN_ID}`;
+            const fs       = require('fs');
+            const marker   = `<!-- devops-agent-postmortem -->`;
+            const failed   = process.env.FAILED_STACK;
+            const applied  = JSON.parse(process.env.APPLIED_JSON || '[]');
+            const stacks   = JSON.parse(process.env.STACKS_JSON  || '[]').map(s => s.stack_id);
+            const skipped  = stacks.filter(s => !applied.includes(s) && s !== failed);
+            const runUrl   = `${process.env.SERVER_URL}/${process.env.REPO}/actions/runs/${process.env.APPLY_RUN_ID}`;
+            const tail     = fs.readFileSync(process.env.TAIL_FILE, 'utf8').slice(-12000);
 
-            // Derive short display IDs (mirrors plan workflow logic)
-            function toDisplayId(id) {
-              return id
-                .replace(/^live-/, '')
-                .replace(/^(infinity|labrynth)-aws-/, '')
-                .replace(/-(us-east-[12]|us-west-2|eu-west-1)-/g, '-')
-                .replace(/-/, ' · ');
-            }
+            const displayName  = process.env.LLM_DISPLAY_NAME || failed;
+            const llmSummary   = process.env.LLM_SUMMARY   || '';
+            const llmCta       = process.env.LLM_CTA       || 'Fix the error below and push a new commit to re-trigger the plan.';
+            const llmDiagnosis = process.env.LLM_DIAGNOSIS || '';
+            const llmFix       = process.env.LLM_FIX       || '';
 
-            const tail = fs.readFileSync(process.env.TAIL_FILE, 'utf8').slice(-12000);
+            function shortId(id) { return (id||'').split('-').slice(-3).join('-') || id; }
 
             const lines = [
               marker,
-              `#### Postmortem — \`${toDisplayId(failed)}\``,
+              `#### Postmortem — \`${displayName}\``,
               '',
               `Approved by @${process.env.APPROVER} · [apply run](${runUrl})`,
-              '',
-              `**What happened:** apply failed on \`${toDisplayId(failed)}\`. Approvals have been dismissed; re-review after fixing.`,
-              '',
-              `**Error category:** \`${process.env.CATEGORY}\``,
-              '',
-              `**Suggested fix:** ${process.env.SUGGESTION}`,
             ];
 
-            if (applied.length > 0) {
-              lines.push('');
-              lines.push('**Applied before failure:**');
-              lines.push(applied.map(s => `- ✅ \`${toDisplayId(s)}\``).join('\n'));
-            }
+            if (llmSummary)   { lines.push('', llmSummary); }
+            if (llmDiagnosis) { lines.push('', `**Root cause:** ${llmDiagnosis}`); }
+            if (llmFix)       { lines.push('', `**Fix:**`, llmFix); }
 
+            if (applied.length > 0) {
+              lines.push('', '**Applied before failure:**');
+              lines.push(applied.map(s => `- ✅ \`${shortId(s)}\``).join('\n'));
+            }
             if (skipped.length > 0) {
-              lines.push('');
-              lines.push('**Skipped (downstream of failure):**');
-              lines.push(skipped.map(s => `- ⏭️ \`${toDisplayId(s)}\``).join('\n'));
+              lines.push('', '**Skipped (downstream of failure):**');
+              lines.push(skipped.map(s => `- ⏭️ \`${shortId(s)}\``).join('\n'));
             }
 
             lines.push(
@@ -268,7 +242,7 @@ jobs:
               '',
               '</details>',
               '',
-              `<!-- llm-summary -->`,
+              `> ${llmCta}`,
             );
 
             const body = lines.join('\n');
