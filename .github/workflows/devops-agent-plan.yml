@@ -79,6 +79,11 @@ on:
         required: false
         type: string
         default: ""
+      pr-author:
+        description: "GitHub login of the PR author. Included in the CTA so they are notified when the plan is ready, regardless of whether they are a human or bot."
+        required: false
+        type: string
+        default: ""
     outputs:
       plan-artifact:
         description: "Name of the uploaded plan artifact."
@@ -505,6 +510,7 @@ jobs:
           DESTROY: ${{ inputs.destroy }}
           POLICY_DIR: ${{ inputs.policy-dir }}
           LIFECYCLE_COMMENT_ID: ${{ inputs.lifecycle-comment-id }}
+          PR_AUTHOR: ${{ inputs.pr-author }}
         with:
           github-token: ${{ steps.app-token.outputs.token }}
           script: |
@@ -558,10 +564,18 @@ jobs:
               : rawDisplayId;
             const llmSummary = process.env.LLM_SUMMARY || '';
             const llmDetails = process.env.LLM_DETAILS || '';
-            const llmCta     = process.env.LLM_CTA
+            const prAuthor   = process.env.PR_AUTHOR || '';
+            // Always @mention the PR author in the CTA so they are notified.
+            // Works for humans and bots alike — no special-casing needed.
+            // Bots (e.g. Devin) receive this as a GitHub notification and can
+            // act on it once configured on their side to respond to this agent.
+            const authorMention = prAuthor ? `@${prAuthor} ` : '';
+            const llmCta     = (process.env.LLM_CTA
+              ? process.env.LLM_CTA.replace(/^(Approve|Review|Merge)/, `${authorMention}$1`)
+              : null)
               || (hasChanges
-                ? 'Approve this PR to apply. Reviewers have been notified.'
-                : 'No infrastructure changes. Approve to merge.');
+                ? `${authorMention}Approve this PR to apply. Reviewers have been notified.`
+                : `${authorMention}No infrastructure changes. Approve to merge.`);
 
             // ── Destroy banner ────────────────────────────────────────────────
             const destroyBanner = isDestroy
