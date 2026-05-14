@@ -189,6 +189,7 @@ jobs:
           TAIL_FILE: ${{ steps.fetch.outputs.tail_file }}
           LLM_DISPLAY_NAME: ${{ steps.llm.outputs.display_name }}
           LLM_SUMMARY: ${{ steps.llm.outputs.summary }}
+          LLM_DETAILS: ${{ steps.llm.outputs.details }}
           LLM_CTA: ${{ steps.llm.outputs.cta }}
           LLM_DIAGNOSIS: ${{ steps.llm.outputs.diagnosis }}
           LLM_FIX: ${{ steps.llm.outputs.fix }}
@@ -206,6 +207,7 @@ jobs:
 
             const displayName  = process.env.LLM_DISPLAY_NAME || failed;
             const llmSummary   = process.env.LLM_SUMMARY   || '';
+            const llmDetails   = process.env.LLM_DETAILS   || '';
             const llmCta       = process.env.LLM_CTA       || 'Fix the error below and push a new commit to re-trigger the plan.';
             const llmDiagnosis = process.env.LLM_DIAGNOSIS || '';
             const llmFix       = process.env.LLM_FIX       || '';
@@ -220,6 +222,7 @@ jobs:
             ];
 
             if (llmSummary)   { lines.push('', llmSummary); }
+            if (llmDetails)   { lines.push('', llmDetails); }
             if (llmDiagnosis) { lines.push('', `**Root cause:** ${llmDiagnosis}`); }
             if (llmFix)       { lines.push('', `**Fix:**`, llmFix); }
 

@@ -534,6 +534,7 @@ jobs:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           LLM_DISPLAY_NAME: ${{ steps.llm.outputs.display_name }}
           LLM_SUMMARY: ${{ steps.llm.outputs.summary }}
+          LLM_DETAILS: ${{ steps.llm.outputs.details }}
           LLM_CTA: ${{ steps.llm.outputs.cta }}
         with:
           github-token: ${{ steps.app-token.outputs.token }}
@@ -547,6 +548,7 @@ jobs:
             const runUrl      = process.env.RUN_URL;
             const llmDisplay  = process.env.LLM_DISPLAY_NAME;
             const llmSummary  = process.env.LLM_SUMMARY  || '';
+            const llmDetails  = process.env.LLM_DETAILS  || '';
             const llmCta      = process.env.LLM_CTA      || '';
 
             const skipped = stacks
@@ -570,12 +572,14 @@ jobs:
               lines.push('');
               lines.push(applied.map(s => `- ✅ \`${fallbackDisplay(s)}\``).join('\n'));
               if (llmSummary) { lines.push('', llmSummary); }
+              if (llmDetails) { lines.push('', llmDetails); }
               if (llmCta)     { lines.push('', `> ${llmCta}`); }
             } else {
               lines.push(`#### Apply failed — \`${primaryDisplay}\``);
               lines.push('');
               lines.push(`Approved by @${approver} · [run](${runUrl})`);
               if (llmSummary) { lines.push('', llmSummary); }
+              if (llmDetails) { lines.push('', llmDetails); }
               lines.push('');
               if (applied.length > 0) {
                 lines.push('**Applied before failure:**');

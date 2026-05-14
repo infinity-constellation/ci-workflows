@@ -392,10 +392,14 @@ jobs:
           ] | .[:40]' "$PLAN_DIR/plan.json")
           echo "resource_names=$RESOURCE_NAMES" >> "$GITHUB_OUTPUT"
 
-          # Plan excerpt for LLM — first 3000 chars of cleaned plan text (enough for context, cheap on tokens).
+          # Plan excerpt for LLM — strip noise then take first 3000 chars.
+          # 1. Strip Terragrunt timestamp prefix
+          # 2. Strip data source lifecycle lines (Reading, Read complete, Still reading)
+          # 3. Strip blank lines that result from removals
           PLAN_EXCERPT=$(cat "$PLAN_DIR/plan.txt" \
-            | sed 's/^[0-9:]\{8,\}\.[0-9]* STDOUT terraform: //' \
-            | grep -v 'data\.[^ ]* .*: \(Reading\.\.\.\|Read complete after\|Still reading\.\.\.\)' \
+            | sed 's/^[0-9][0-9]:[0-9][0-9]:[0-9][0-9]\.[0-9]* STDOUT terraform: //' \
+            | grep -vE '^data\.[^[:space:]]+ .+: (Reading\.\.\.|Read complete after|Still reading\.\.\.|Refreshing state)' \
+            | grep -vE '^$' \
             | head -c 3000 || true)
           {
             echo "plan_excerpt<<__PLAN_EOF__"
@@ -461,6 +465,7 @@ jobs:
           STACK_ID: ${{ steps.resolve.outputs.stack_id }}
           DISPLAY_ID: ${{ steps.llm.outputs.display_name || steps.resolve.outputs.stack_id }}
           LLM_SUMMARY: ${{ steps.llm.outputs.summary }}
+          LLM_DETAILS: ${{ steps.llm.outputs.details }}
           LLM_CTA: ${{ steps.llm.outputs.cta }}
           ADDS: ${{ steps.summarize.outputs.adds }}
           CHANGES: ${{ steps.summarize.outputs.changes }}
@@ -506,8 +511,9 @@ jobs:
             ].filter(Boolean).join('  ') || 'no changes';
 
             // ── LLM outputs (with static fallbacks) ──────────────────────────
-            const displayId = process.env.DISPLAY_ID || process.env.STACK_ID;
+            const displayId  = process.env.DISPLAY_ID  || process.env.STACK_ID;
             const llmSummary = process.env.LLM_SUMMARY || '';
+            const llmDetails = process.env.LLM_DETAILS || '';
             const llmCta     = process.env.LLM_CTA
               || (hasChanges
                 ? 'Approve this PR to apply. Reviewers have been notified.'
@@ -534,6 +540,7 @@ jobs:
               destroyBanner,
               ...(policyLine ? [policyLine, ''] : []),
               ...(llmSummary ? [llmSummary, ''] : []),
+              ...(llmDetails ? [llmDetails, ''] : []),
               `<details><summary>Plan output</summary>`,
               '',
               '```',

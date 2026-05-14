@@ -138,6 +138,7 @@ jobs:
           UNOWNED: ${{ steps.resolve.outputs.unowned-paths }}
           APPROVER: ${{ github.event.review.user.login }}
           LLM_SUMMARY: ${{ steps.llm.outputs.summary }}
+          LLM_DETAILS: ${{ steps.llm.outputs.details }}
           LLM_CTA: ${{ steps.llm.outputs.cta }}
           LLM_DIAGNOSIS: ${{ steps.llm.outputs.diagnosis }}
         with:
@@ -148,6 +149,7 @@ jobs:
             const covering = JSON.parse(process.env.COVERING || '[]');
             const unowned  = JSON.parse(process.env.UNOWNED  || '[]');
             const llmSummary   = process.env.LLM_SUMMARY   || '';
+            const llmDetails   = process.env.LLM_DETAILS   || '';
             const llmCta       = process.env.LLM_CTA       || '';
             const llmDiagnosis = process.env.LLM_DIAGNOSIS || '';
 
@@ -167,6 +169,7 @@ jobs:
               }
             }
             if (llmSummary) { lines.push('', llmSummary); }
+            if (llmDetails) { lines.push('', llmDetails); }
             lines.push('', llmCta
               ? `> ${llmCta}`
               : '_Approval recorded by GitHub but apply was not triggered._');
@@ -239,6 +242,7 @@ jobs:
         env:
           LLM_DISPLAY_NAME: ${{ steps.llm.outputs.display_name }}
           LLM_SUMMARY: ${{ steps.llm.outputs.summary }}
+          LLM_DETAILS: ${{ steps.llm.outputs.details }}
           LLM_CTA: ${{ steps.llm.outputs.cta }}
         with:
           github-token: ${{ steps.app-token.outputs.token }}
@@ -246,6 +250,7 @@ jobs:
             const marker     = `<!-- devops-agent-approval-${process.env.APPROVER} -->`;
             const llmDisplay = process.env.LLM_DISPLAY_NAME || '';
             const llmSummary = process.env.LLM_SUMMARY      || '';
+            const llmDetails = process.env.LLM_DETAILS      || '';
             const llmCta     = process.env.LLM_CTA          || 'Apply is running in dependency order. The PR will auto-merge on success.';
 
             const stacks = JSON.parse(process.env.STACKS_JSON || '[]').map(s => s.stack_id);
@@ -262,6 +267,7 @@ jobs:
               stacks.map(s => `- \`${shortId(s)}\``).join('\n'),
             ];
             if (llmSummary) { lines.push('', llmSummary); }
+            if (llmDetails) { lines.push('', llmDetails); }
             lines.push('', `> ${llmCta}`);
 
             const body = lines.join('\n');
