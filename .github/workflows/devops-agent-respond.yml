@@ -180,9 +180,10 @@ jobs:
 
           BODY="@${COMMENT_AUTHOR} ${RESPONSE}"
 
+          # --raw-field treats the value as a literal string (not a filename)
           gh api "repos/$REPO/issues/$PR_NUMBER/comments" \
             --method POST \
-            --field body="$BODY"
+            --raw-field body="$BODY"
 
       - name: Remove thinking reaction
         if: always()
