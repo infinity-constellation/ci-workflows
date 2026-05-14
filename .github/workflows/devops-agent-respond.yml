@@ -43,16 +43,10 @@ permissions:
 
 jobs:
   respond:
-    # Only fire on PR comments that address Gravity's DevOps Agent.
-    # Wake-words: @gravity-devops-agent, @Gravity, or starting with "Gravity"
-    if: |
-      github.event.issue.pull_request != null &&
-      github.event.issue.state == 'open' &&
-      github.event.comment.user.type != 'Bot' && (
-        contains(github.event.comment.body, '@gravity-devops-agent') ||
-        contains(github.event.comment.body, '@Gravity') ||
-        startsWith(github.event.comment.body, 'Gravity')
-      )
+    # The caller's if: condition already filtered for valid wake-word comments
+    # on open PRs from non-bot users. No duplicate filtering needed here since
+    # github.event.* from the caller's issue_comment context is not reliably
+    # available through workflow_call.
     runs-on: ubuntu-latest
     steps:
       - name: Generate gravity-devops-agent token
