@@ -19,7 +19,7 @@ inputs:
     default: "openai/gpt-4o-mini"
 
 outputs:
-  display-name:
+  display_name:
     description: "Short human-readable name for the primary stack(s)."
     value: ${{ steps.call.outputs.display_name }}
   summary:
