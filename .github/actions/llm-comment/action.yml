@@ -58,7 +58,7 @@ runs:
 
         # ── Build prompts and payload via Python (avoids all shell quoting issues) ──
         PAYLOAD_FILE=$(mktemp)
-        OUTPUT_FILE=$(mktemp)
+        export PAYLOAD_FILE
 
         python3 - <<'PYEOF'
         import os, json, sys
