@@ -591,6 +591,59 @@ jobs:
 
             // ── Assemble ──────────────────────────────────────────────────────
             const marker = `<!-- devops-agent-plan:${process.env.STACK_ID} -->`;
+
+            // ── No-changes plans: minimal output, no plan output block ────────
+            if (!hasChanges && !isDestroy) {
+              const noChangeSummary = llmSummary || `No changes — \`${displayId}\` matches configuration.`;
+              const noChangeCta     = llmCta;
+
+              const noChangeBody = [
+                marker,
+                `#### \`${displayId}\` — ${countBadge}`,
+                '',
+                noChangeSummary,
+                '',
+                `> ${noChangeCta}`,
+              ].join('\n');
+
+              const { owner, repo } = context.repo;
+              const issue_number = context.payload.pull_request.number;
+              const { data: noCmts } = await github.rest.issues.listComments({
+                owner, repo, issue_number, per_page: 100,
+              });
+              const noExisting = noCmts.find(c =>
+                c.user && c.user.type === 'Bot' && c.body && c.body.includes(marker)
+              );
+
+              // Lifecycle comment: append a compact no-change section
+              const lifecycleIdNc = process.env.LIFECYCLE_COMMENT_ID;
+              if (lifecycleIdNc && parseInt(lifecycleIdNc)) {
+                const stackMark = `<!-- devops-agent-stack:${process.env.STACK_ID} -->`;
+                const { data: lc } = await github.rest.issues.getComment({
+                  owner, repo, comment_id: parseInt(lifecycleIdNc),
+                });
+                let lcBody = lc.body || '';
+                const compactSection = `${stackMark}\n#### \`${displayId}\` — ${countBadge}\n\n${noChangeSummary}`;
+                if (lcBody.includes(stackMark)) {
+                  const re = new RegExp(`${stackMark.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')}[\\s\\S]*?(?=<!--|$)`);
+                  lcBody = lcBody.replace(re, compactSection + '\n');
+                } else {
+                  lcBody = lcBody.replace(/> ⏳ Plan running\.\.\.\n?/, '').replace(/\n_Plan results will appear here when complete\._\n?/, '');
+                  lcBody = lcBody.trimEnd() + '\n\n---\n\n' + compactSection;
+                }
+                lcBody = lcBody.replace(/\n> .+$/, '');
+                await github.rest.issues.updateComment({
+                  owner, repo, comment_id: parseInt(lifecycleIdNc), body: lcBody.trimEnd() + `\n\n> ${noChangeCta}`,
+                });
+              } else if (noExisting) {
+                await github.rest.issues.updateComment({ owner, repo, comment_id: noExisting.id, body: noChangeBody });
+              } else {
+                await github.rest.issues.createComment({ owner, repo, issue_number, body: noChangeBody });
+              }
+              return; // done — skip the full plan output block below
+            }
+
+            // ── Changes plan: full output ─────────────────────────────────────
             const lines = [
               marker,
               `#### \`${displayId}\` — ${countBadge}`,
