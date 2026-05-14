@@ -1,15 +1,19 @@
 name: gravity-devops-agent — respond
 
 # Reusable workflow: called by a thin caller in each portco repo when
-# someone mentions @gravity-devops-agent in a PR comment.
-# The agent gathers context, calls the LLM, and replies in the thread.
+# someone addresses Gravity's DevOps Agent in a PR comment.
+#
+# Wake-words (case-insensitive, any of):
+#   @gravity-devops-agent ...
+#   @Gravity ...
+#   Gravity, ...
 #
 # Supported interactions (intent detected by LLM, not keyword matching):
-#   @gravity-devops-agent what does this plan change?
-#   @gravity-devops-agent why did the apply fail?
+#   Gravity, what does this plan change?
+#   @Gravity why did the apply fail?
 #   @gravity-devops-agent is it safe to approve this?
-#   @gravity-devops-agent re-run the plan
-#   @gravity-devops-agent explain <anything about the PR>
+#   @Gravity re-run the plan
+#   Gravity, explain <anything about the PR>
 #
 # Caller: add a respond.yml to .github/workflows/ with:
 #   on:
@@ -19,9 +23,12 @@ name: gravity-devops-agent — respond
 #     respond:
 #       if: |
 #         github.event.issue.pull_request != null &&
-#         contains(github.event.comment.body, '@gravity-devops-agent') &&
 #         github.event.issue.state == 'open' &&
-#         github.event.comment.user.type != 'Bot'
+#         github.event.comment.user.type != 'Bot' && (
+#           contains(github.event.comment.body, '@gravity-devops-agent') ||
+#           contains(github.event.comment.body, '@Gravity') ||
+#           startsWith(github.event.comment.body, 'Gravity')
+#         )
 #       uses: infinity-constellation/ci-workflows/.github/workflows/devops-agent-respond.yml@main
 #       secrets: inherit
 
@@ -36,12 +43,16 @@ permissions:
 
 jobs:
   respond:
-    # Only fire on PR comments (not issue comments) that mention the agent.
+    # Only fire on PR comments that address Gravity's DevOps Agent.
+    # Wake-words: @gravity-devops-agent, @Gravity, or starting with "Gravity"
     if: |
       github.event.issue.pull_request != null &&
-      contains(github.event.comment.body, '@gravity-devops-agent') &&
       github.event.issue.state == 'open' &&
-      github.event.comment.user.type != 'Bot'
+      github.event.comment.user.type != 'Bot' && (
+        contains(github.event.comment.body, '@gravity-devops-agent') ||
+        contains(github.event.comment.body, '@Gravity') ||
+        startsWith(github.event.comment.body, 'Gravity')
+      )
     runs-on: ubuntu-latest
     steps:
       - name: Generate gravity-devops-agent token
@@ -62,8 +73,13 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Strip the @mention to get the raw question.
-          QUESTION=$(echo "$COMMENT_BODY" | sed 's/@gravity-devops-agent//g' | xargs)
+          # Strip the wake-word to get the raw question.
+          # Handles: @gravity-devops-agent, @Gravity, Gravity,  (case-insensitive)
+          QUESTION=$(echo "$COMMENT_BODY" \
+            | sed -E 's/@gravity-devops-agent//gi' \
+            | sed -E 's/@[Gg]ravity//g' \
+            | sed -E 's/^[Gg]ravity[,:]?//g' \
+            | xargs)
           echo "question<<__Q_EOF__"  >> "$GITHUB_OUTPUT"
           echo "$QUESTION"            >> "$GITHUB_OUTPUT"
           echo "__Q_EOF__"            >> "$GITHUB_OUTPUT"
