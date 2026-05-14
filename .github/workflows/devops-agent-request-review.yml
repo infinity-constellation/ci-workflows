@@ -1,0 +1,171 @@
+name: gravity-devops-agent — request review
+
+# Reusable workflow: called by the caller's infra.yml immediately after
+# discover completes (in parallel with the plan matrix). Parses CODEOWNERS
+# for the affected paths and requests reviews from every owner that covers
+# those paths, excluding the PR author.
+#
+# Fires early — while plans are still running — so reviewers are notified
+# and can begin reviewing plan comments as they land in real time.
+#
+# Idempotent: re-requesting a reviewer who already reviewed or is already
+# requested is a no-op on GitHub's side. Re-requesting after a dismissed
+# review re-notifies them (intentional — a new push invalidated the prior
+# approval, so they need to re-review).
+
+on:
+  workflow_call:
+    inputs:
+      affected-paths:
+        description: |
+          Newline-separated list of repo-relative paths the PR touches.
+          Produced by the discover step and passed through from the caller.
+        required: true
+        type: string
+      codeowners-path:
+        description: "Repo-relative path to CODEOWNERS. Defaults to .github/CODEOWNERS."
+        required: false
+        type: string
+        default: ".github/CODEOWNERS"
+    outputs:
+      reviewers-requested:
+        description: "Comma-separated list of users/teams review was requested from."
+        value: ${{ jobs.request.outputs.reviewers_requested }}
+
+permissions:
+  pull-requests: write
+  contents: read
+
+jobs:
+  request:
+    runs-on: ubuntu-latest
+    outputs:
+      reviewers_requested: ${{ steps.request.outputs.reviewers_requested }}
+    steps:
+      - name: Checkout CODEOWNERS
+        uses: actions/checkout@v6
+        with:
+          sparse-checkout: ${{ inputs.codeowners-path }}
+          sparse-checkout-cone-mode: false
+          fetch-depth: 1
+
+      - name: Parse CODEOWNERS and request reviews
+        id: request
+        uses: actions/github-script@v9
+        env:
+          AFFECTED_PATHS: ${{ inputs.affected-paths }}
+          CODEOWNERS_PATH: ${{ inputs.codeowners-path }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+
+            const coPath = process.env.CODEOWNERS_PATH;
+            if (!fs.existsSync(coPath)) {
+              core.warning(`CODEOWNERS not found at ${coPath} — skipping review requests.`);
+              core.setOutput('reviewers_requested', '');
+              return;
+            }
+
+            // ----------------------------------------------------------------
+            // Parse CODEOWNERS.
+            // Semantics: last matching rule wins per path (GitHub behaviour).
+            // Supports: * catch-all, directory prefix, leading-wildcard *.ext
+            // Does not support: negation patterns (!), regex
+            // ----------------------------------------------------------------
+            function parseCODEOWNERS(text) {
+              const rules = [];
+              for (const raw of text.split('\n')) {
+                const line = raw.replace(/#.*/, '').trim();
+                if (!line) continue;
+                const [pattern, ...owners] = line.split(/\s+/);
+                if (owners.length) rules.push({ pattern, owners });
+              }
+              return rules;
+            }
+
+            function patternMatches(pattern, filePath) {
+              if (pattern === '*') return true;
+              const p = pattern.replace(/\/$/, ''); // strip trailing slash
+              if (filePath === p || filePath.startsWith(p + '/')) return true;
+              if (pattern.startsWith('*')) {
+                const re = new RegExp(
+                  '^' + pattern.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*') + '$'
+                );
+                return re.test(filePath) || re.test(path.basename(filePath));
+              }
+              return false;
+            }
+
+            function ownersForPath(rules, filePath) {
+              let result = [];
+              for (const rule of rules) {
+                if (patternMatches(rule.pattern, filePath)) result = rule.owners;
+              }
+              return result;
+            }
+
+            // ----------------------------------------------------------------
+            // Resolve owners for all affected paths.
+            // Collect the union — every owner that covers ANY affected path
+            // gets notified. The approve workflow enforces the intersection
+            // (all paths must be covered) separately.
+            // ----------------------------------------------------------------
+            const coText = fs.readFileSync(coPath, 'utf8');
+            const rules = parseCODEOWNERS(coText);
+            const affectedPaths = (process.env.AFFECTED_PATHS || '').split('\n').filter(Boolean);
+            const author = process.env.PR_AUTHOR;
+
+            const ownerSet = new Set();
+            for (const p of affectedPaths) {
+              for (const o of ownersForPath(rules, p)) ownerSet.add(o);
+            }
+
+            const reviewers = [];
+            const teamReviewers = [];
+            for (const o of ownerSet) {
+              if (!o.startsWith('@')) continue; // ignore email entries
+              const handle = o.slice(1);
+              if (handle.includes('/')) {
+                // @org/team format — extract just the team slug
+                teamReviewers.push(handle.split('/')[1]);
+              } else if (handle !== author) {
+                // Skip the PR author — GitHub rejects self-review requests
+                reviewers.push(handle);
+              }
+            }
+
+            if (!reviewers.length && !teamReviewers.length) {
+              core.info(
+                `No reviewers to request. Author (${author}) is the only CODEOWNER, ` +
+                `or no CODEOWNERS rules match the affected paths.`
+              );
+              core.setOutput('reviewers_requested', '');
+              return;
+            }
+
+            const label = [
+              ...reviewers,
+              ...teamReviewers.map(t => `team:${t}`),
+            ].join(', ');
+            core.info(`Requesting reviews from: ${label}`);
+
+            const { owner, repo } = context.repo;
+            const pull_number = context.payload.pull_request.number;
+
+            try {
+              await github.rest.pulls.requestReviewers({
+                owner,
+                repo,
+                pull_number,
+                reviewers,
+                team_reviewers: teamReviewers,
+              });
+              core.setOutput('reviewers_requested', label);
+            } catch (e) {
+              // 422 = already requested, already reviewed, or author —
+              // all expected in normal operation; warn but don't fail.
+              core.warning(`Review request call failed (may be benign): ${e.message}`);
+              core.setOutput('reviewers_requested', '');
+            }
