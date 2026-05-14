@@ -143,6 +143,34 @@ jobs:
               }
             }
 
+            // ----------------------------------------------------------------
+            // Also re-request anyone who previously submitted an APPROVED
+            // review but was dismissed by GitHub when this push landed.
+            // GitHub's requestReviewers API is idempotent for pending requests
+            // but will create a fresh review request for dismissed reviewers,
+            // re-notifying them without requiring them to be in CODEOWNERS.
+            // ----------------------------------------------------------------
+            const { owner, repo } = context.repo;
+            const pull_number = context.payload.pull_request.number;
+            try {
+              const { data: existingReviews } = await github.rest.pulls.listReviews({
+                owner, repo, pull_number, per_page: 100,
+              });
+              for (const r of existingReviews) {
+                const login = r.user && r.user.login;
+                if (!login || login === author) continue;
+                if (r.state === 'APPROVED' || r.state === 'DISMISSED') {
+                  // Re-request this reviewer if not already in the list
+                  if (!reviewers.includes(login) && !login.includes('/')) {
+                    core.info(`Re-requesting prior reviewer @${login} (state was ${r.state})`);
+                    reviewers.push(login);
+                  }
+                }
+              }
+            } catch (e) {
+              core.warning(`Could not fetch existing reviews: ${e.message}`);
+            }
+
             if (!reviewers.length && !teamReviewers.length) {
               core.info(
                 `No reviewers to request. Author (${author}) is the only CODEOWNER, ` +
@@ -158,9 +186,6 @@ jobs:
             ].join(', ');
             core.info(`Requesting reviews from: ${label}`);
 
-            const { owner, repo } = context.repo;
-            const pull_number = context.payload.pull_request.number;
-
             try {
               await github.rest.pulls.requestReviewers({
                 owner,
@@ -171,10 +196,32 @@ jobs:
               });
               core.setOutput('reviewers_requested', label);
             } catch (e) {
-              // 422 = already requested, already reviewed, or author —
-              // all expected in normal operation; warn but don't fail.
-              core.warning(`Review request call failed (may be benign): ${e.message}`);
-              core.setOutput('reviewers_requested', '');
+              // 422 = already requested or author — expected in normal operation.
+              // Try requesting each reviewer individually so a single 422 doesn't
+              // block the others.
+              core.warning(`Batch review request failed: ${e.message} — retrying individually`);
+              const requested = [];
+              for (const r of reviewers) {
+                try {
+                  await github.rest.pulls.requestReviewers({
+                    owner, repo, pull_number, reviewers: [r],
+                  });
+                  requested.push(r);
+                } catch (e2) {
+                  core.warning(`Could not request @${r}: ${e2.message}`);
+                }
+              }
+              for (const t of teamReviewers) {
+                try {
+                  await github.rest.pulls.requestReviewers({
+                    owner, repo, pull_number, team_reviewers: [t],
+                  });
+                  requested.push(`team:${t}`);
+                } catch (e2) {
+                  core.warning(`Could not request team:${t}: ${e2.message}`);
+                }
+              }
+              core.setOutput('reviewers_requested', requested.join(', '));
             }
 
       - name: Post pending approval status

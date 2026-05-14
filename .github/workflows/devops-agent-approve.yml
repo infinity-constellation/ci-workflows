@@ -46,6 +46,15 @@ on:
         required: false
         type: boolean
         default: false
+      approver-login:
+        description: |
+          Approver login to use instead of github.event.review.user.login.
+          Set this when calling from a pull_request event context where an
+          existing eligible approval has already been recorded (re-plan case).
+          When set, the filter step allows proceeding without a review event.
+        required: false
+        type: string
+        default: ""
       runs-on:
         description: "Runner label."
         required: false
@@ -97,8 +106,16 @@ jobs:
         env:
           EVENT_NAME: ${{ github.event_name }}
           REVIEW_STATE: ${{ github.event.review.state }}
+          APPROVER_OVERRIDE: ${{ inputs.approver-login }}
         run: |
           set -euo pipefail
+          # Allow proceeding when an approver override is supplied — this
+          # covers the re-plan case where a pull_request event fires after
+          # an existing eligible approval is already on record.
+          if [ -n "$APPROVER_OVERRIDE" ]; then
+            echo "proceed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           if [ "$EVENT_NAME" != "pull_request_review" ]; then
             echo "::notice::Not a pull_request_review event ($EVENT_NAME); no-op."
             echo "proceed=false" >> "$GITHUB_OUTPUT"
@@ -121,7 +138,7 @@ jobs:
         id: resolve
         uses: infinity-constellation/ci-workflows/.github/actions/devops-agent-resolve-approver@main
         with:
-          approver-login: ${{ github.event.review.user.login }}
+          approver-login: ${{ github.event.review.user.login || inputs.approver-login }}
           affected-paths: ${{ inputs.affected-paths }}
           codeowners-path: ${{ inputs.codeowners-path }}
           github-token: ${{ steps.app-token.outputs.token }}
@@ -135,7 +152,7 @@ jobs:
           openrouter-api-key: ${{ secrets.OPENROUTER_API_KEY }}
           context-json: >-
             {
-              "approver": "${{ github.event.review.user.login }}",
+              "approver": "${{ github.event.review.user.login || inputs.approver-login }}",
               "eligible": ${{ steps.resolve.outputs.eligible == 'true' }},
               "reason": ${{ toJSON(steps.resolve.outputs.reason) }},
               "covering_owners": ${{ steps.resolve.outputs.covering-owners || '[]' }},
@@ -150,7 +167,7 @@ jobs:
           REASON: ${{ steps.resolve.outputs.reason }}
           COVERING: ${{ steps.resolve.outputs.covering-owners }}
           UNOWNED: ${{ steps.resolve.outputs.unowned-paths }}
-          APPROVER: ${{ github.event.review.user.login }}
+          APPROVER: ${{ github.event.review.user.login || inputs.approver-login }}
           LLM_SUMMARY: ${{ steps.llm.outputs.summary }}
           LLM_DETAILS: ${{ steps.llm.outputs.details }}
           LLM_CTA: ${{ steps.llm.outputs.cta }}
@@ -230,7 +247,7 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           HEAD_BRANCH: ${{ github.event.pull_request.head.ref }}
-          APPROVER_LOGIN: ${{ github.event.review.user.login }}
+          APPROVER_LOGIN: ${{ github.event.review.user.login || inputs.approver-login }}
           REPO: ${{ github.repository }}
           REF: ${{ github.ref }}
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
@@ -276,7 +293,7 @@ jobs:
         if: steps.filter.outputs.proceed == 'true' && steps.dispatch.outputs.dispatched == 'true'
         uses: actions/github-script@v9
         env:
-          APPROVER: ${{ github.event.review.user.login }}
+          APPROVER: ${{ github.event.review.user.login || inputs.approver-login }}
           STACKS_JSON: ${{ inputs.stacks }}
           LLM_DISPLAY_NAME: ${{ steps.llm.outputs.display_name }}
           LLM_SUMMARY: ${{ steps.llm.outputs.summary }}
