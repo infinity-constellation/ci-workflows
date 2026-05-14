@@ -401,8 +401,6 @@ jobs:
       - name: Comment plan on PR
         if: ${{ steps.resolve.outputs.bootstrap != 'true' && github.event_name == 'pull_request' }}
         uses: actions/github-script@v9
-        with:
-          github-token: ${{ steps.app-token.outputs.token }}
         env:
           PLAN_DIR: ${{ steps.plan.outputs.plan_dir }}
           STACK_ID: ${{ steps.resolve.outputs.stack_id }}
@@ -415,6 +413,7 @@ jobs:
           DESTROY: ${{ inputs.destroy }}
           POLICY_DIR: ${{ inputs.policy-dir }}
         with:
+          github-token: ${{ steps.app-token.outputs.token }}
           script: |
             const fs = require('fs');
             const path = require('path');

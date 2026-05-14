@@ -59,13 +59,12 @@ jobs:
       - name: Parse CODEOWNERS and request reviews
         id: request
         uses: actions/github-script@v9
-        with:
-          github-token: ${{ steps.app-token.outputs.token }}
         env:
           AFFECTED_PATHS: ${{ inputs.affected-paths }}
           CODEOWNERS_PATH: ${{ inputs.codeowners-path }}
           PR_AUTHOR: ${{ github.event.pull_request.user.login }}
         with:
+          github-token: ${{ steps.app-token.outputs.token }}
           script: |
             const fs = require('fs');
             const path = require('path');

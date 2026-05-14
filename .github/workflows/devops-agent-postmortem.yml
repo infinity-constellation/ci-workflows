@@ -64,11 +64,10 @@ jobs:
 
       - name: Dismiss all current approvals
         uses: actions/github-script@v9
-        with:
-          github-token: ${{ steps.app-token.outputs.token }}
         env:
           PR_NUMBER: ${{ inputs.pr-number }}
         with:
+          github-token: ${{ steps.app-token.outputs.token }}
           script: |
             const issue_number = parseInt(process.env.PR_NUMBER, 10);
             const { owner, repo } = context.repo;
@@ -93,11 +92,10 @@ jobs:
 
       - name: Add apply-failure label
         uses: actions/github-script@v9
-        with:
-          github-token: ${{ steps.app-token.outputs.token }}
         env:
           PR_NUMBER: ${{ inputs.pr-number }}
         with:
+          github-token: ${{ steps.app-token.outputs.token }}
           script: |
             const issue_number = parseInt(process.env.PR_NUMBER, 10);
             const { owner, repo } = context.repo;
@@ -201,8 +199,6 @@ jobs:
 
       - name: Post structured postmortem comment
         uses: actions/github-script@v9
-        with:
-          github-token: ${{ steps.app-token.outputs.token }}
         env:
           PR_NUMBER: ${{ inputs.pr-number }}
           FAILED_STACK: ${{ inputs.failed-stack }}
@@ -216,6 +212,7 @@ jobs:
           SUGGESTION: ${{ steps.classify.outputs.suggestion }}
           TAIL_FILE: ${{ steps.fetch.outputs.tail_file }}
         with:
+          github-token: ${{ steps.app-token.outputs.token }}
           script: |
             const fs = require('fs');
             const marker = `<!-- devops-agent-postmortem -->`;
