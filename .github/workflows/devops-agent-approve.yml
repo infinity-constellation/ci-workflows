@@ -320,7 +320,7 @@ jobs:
             const stacks = JSON.parse(process.env.STACKS_JSON || '[]').map(s => s.stack_id);
 
             const heading = llmDisplay
-              ? `#### Applied — ${llmDisplay}`
+              ? `#### Apply queued — ${llmDisplay}`
               : `#### Apply queued`;
 
             const lines = [
@@ -328,6 +328,8 @@ jobs:
               heading,
               '',
               `Approved by @${approver} · [run](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions)`,
+              '',
+              'Apply has been queued; no infrastructure changes have been made yet.',
             ];
 
             if (llmSummary) { lines.push('', llmSummary); }
