@@ -179,6 +179,7 @@ jobs:
           fetch-depth: 1
 
       - name: Verify head SHA matches PR head
+        id: head-check
         env:
           PR_NUMBER: ${{ inputs.pr-number }}
           EXPECTED_SHA: ${{ inputs.head-sha }}
@@ -188,16 +189,26 @@ jobs:
           ACTUAL_SHA=$(gh pr view "$PR_NUMBER" --json headRefOid --jq .headRefOid \
             --repo "$GITHUB_REPOSITORY")
           if [ "$ACTUAL_SHA" != "$EXPECTED_SHA" ]; then
-            echo "::error::PR #$PR_NUMBER head is now $ACTUAL_SHA but apply was authorized against $EXPECTED_SHA. New commits invalidate prior approvals; refusing."
-            exit 1
+            MSG="PR #$PR_NUMBER head is now $ACTUAL_SHA but apply was authorized against $EXPECTED_SHA. New commits invalidate prior approvals; refusing to apply this saved plan."
+            echo "::warning::$MSG"
+            {
+              echo "can_apply=false"
+              echo "refusal_reason=head_moved"
+              echo "refusal_message=$MSG"
+              echo "actual_head_sha=$ACTUAL_SHA"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
           fi
+          echo "can_apply=true" >> "$GITHUB_OUTPUT"
           echo "Confirmed apply against authorized head $EXPECTED_SHA"
 
       - name: Verify PR branch is up-to-date with main
+        id: preapply
+        if: ${{ steps.head-check.outputs.can_apply != 'false' }}
         env:
           PR_NUMBER: ${{ inputs.pr-number }}
           HEAD_SHA: ${{ inputs.head-sha }}
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
 
@@ -226,21 +237,50 @@ jobs:
             MSG="PR #$PR_NUMBER is not up-to-date with $DEFAULT_BRANCH."
             MSG="$MSG The plan was produced before $(git rev-parse --short "$MAIN_TIP") was merged;"
             MSG="$MSG applying it now could silently override or conflict with those changes."
-            MSG="$MSG Rebase or merge $DEFAULT_BRANCH into this branch, re-run the plan,"
-            MSG="$MSG and get a fresh approval before applying."
-            echo "::error::$MSG"
-            exit 1
+            MSG="$MSG The agent will request a branch update so a fresh plan can run."
+            echo "::warning::$MSG"
+
+            UPDATE_STATUS="not_attempted"
+            UPDATE_MESSAGE=""
+            if UPDATE_OUTPUT=$(gh api \
+                --method PUT \
+                "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/update-branch" \
+                -f "expected_head_sha=$HEAD_SHA" 2>&1); then
+              UPDATE_STATUS="requested"
+              UPDATE_MESSAGE="Requested GitHub to update this PR branch from $DEFAULT_BRANCH. A new plan should start automatically."
+              echo "$UPDATE_MESSAGE"
+            else
+              UPDATE_STATUS="failed"
+              UPDATE_MESSAGE="$UPDATE_OUTPUT"
+              echo "::warning::Could not request branch update: $UPDATE_OUTPUT"
+            fi
+
+            {
+              echo "can_apply=false"
+              echo "refusal_reason=stale_base"
+              echo "refusal_message=$MSG"
+              echo "default_branch=$DEFAULT_BRANCH"
+              echo "base_sha=$MAIN_TIP"
+              echo "branch_update_status=$UPDATE_STATUS"
+              echo "branch_update_message<<EOF"
+              echo "$UPDATE_MESSAGE"
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
           fi
 
+          echo "can_apply=true" >> "$GITHUB_OUTPUT"
           echo "PR branch is up-to-date with $DEFAULT_BRANCH (status=$STATUS, behind_by=$BEHIND)"
 
       - name: Set up IaC tools
+        if: ${{ steps.head-check.outputs.can_apply != 'false' && steps.preapply.outputs.can_apply != 'false' }}
         uses: infinity-constellation/ci-workflows/.github/actions/setup-iac-tools@main
         with:
           terraform-version: ${{ inputs.terraform-version }}
           terragrunt-version: ${{ inputs.terragrunt-version }}
 
       - name: Configure AWS (OIDC)
+        if: ${{ steps.head-check.outputs.can_apply != 'false' && steps.preapply.outputs.can_apply != 'false' }}
         uses: aws-actions/configure-aws-credentials@v6
         with:
           role-to-assume: ${{ steps.resolve.outputs.aws_role_to_assume }}
@@ -248,6 +288,7 @@ jobs:
           role-session-name: devops-agent-apply-pr${{ inputs.pr-number }}-${{ github.run_id }}
 
       - name: Download saved plans
+        if: ${{ steps.head-check.outputs.can_apply != 'false' && steps.preapply.outputs.can_apply != 'false' }}
         env:
           STACKS_JSON: ${{ inputs.stacks }}
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
@@ -283,6 +324,7 @@ jobs:
 
       - name: Compute apply order (Terragrunt graph-dependencies)
         id: order
+        if: ${{ steps.head-check.outputs.can_apply != 'false' && steps.preapply.outputs.can_apply != 'false' }}
         env:
           STACKS_JSON: ${{ inputs.stacks }}
         run: |
@@ -394,6 +436,7 @@ jobs:
 
       - name: Apply in topological order
         id: apply
+        if: ${{ steps.head-check.outputs.can_apply != 'false' && steps.preapply.outputs.can_apply != 'false' }}
         env:
           STACKS_JSON: ${{ inputs.stacks }}
           ORDER_FILE: ${{ steps.order.outputs.order_file }}
@@ -486,14 +529,30 @@ jobs:
           STACKS_JSON: ${{ inputs.stacks }}
           APPLIED_JSON: ${{ steps.apply.outputs.applied }}
           FAILED_STACK: ${{ steps.apply.outputs.failed_stack }}
+          HEAD_REFUSAL_REASON: ${{ steps.head-check.outputs.refusal_reason }}
+          HEAD_REFUSAL_MESSAGE: ${{ steps.head-check.outputs.refusal_message }}
+          PREAPPLY_REFUSAL_REASON: ${{ steps.preapply.outputs.refusal_reason }}
+          PREAPPLY_REFUSAL_MESSAGE: ${{ steps.preapply.outputs.refusal_message }}
+          BRANCH_UPDATE_STATUS: ${{ steps.preapply.outputs.branch_update_status }}
+          BRANCH_UPDATE_MESSAGE: ${{ steps.preapply.outputs.branch_update_message }}
           PR_NUMBER: ${{ inputs.pr-number }}
           APPROVER_LOGIN: ${{ inputs.approver-login }}
           JOB_STATUS: ${{ job.status }}
         run: |
           set -euo pipefail
 
+          APPLIED_JSON="${APPLIED_JSON:-[]}"
+          if [ -z "$APPLIED_JSON" ]; then
+            APPLIED_JSON="[]"
+          fi
+
+          REFUSAL_REASON="${HEAD_REFUSAL_REASON:-${PREAPPLY_REFUSAL_REASON:-}}"
+          REFUSAL_MESSAGE="${HEAD_REFUSAL_MESSAGE:-${PREAPPLY_REFUSAL_MESSAGE:-}}"
+
           OUTCOME="success"
-          if [ "$JOB_STATUS" != "success" ] || [ -n "$FAILED_STACK" ]; then
+          if [ -n "$REFUSAL_REASON" ]; then
+            OUTCOME="action_required"
+          elif [ "$JOB_STATUS" != "success" ] || [ -n "$FAILED_STACK" ]; then
             OUTCOME="failure"
           fi
 
@@ -501,6 +560,14 @@ jobs:
             echo "outcome=$OUTCOME"
             echo "applied_stacks=$APPLIED_JSON"
             echo "failed_stack=$FAILED_STACK"
+            echo "refusal_reason=$REFUSAL_REASON"
+            echo "refusal_message<<EOF"
+            echo "$REFUSAL_MESSAGE"
+            echo "EOF"
+            echo "branch_update_status=${BRANCH_UPDATE_STATUS:-}"
+            echo "branch_update_message<<EOF"
+            echo "${BRANCH_UPDATE_MESSAGE:-}"
+            echo "EOF"
           } >> "$GITHUB_OUTPUT"
 
           {
@@ -508,6 +575,19 @@ jobs:
             echo ""
             echo "**PR**: #$PR_NUMBER  **Approver**: @$APPROVER_LOGIN"
             echo ""
+            if [ -n "$REFUSAL_REASON" ]; then
+              echo "**Pre-apply status**: \`$REFUSAL_REASON\`"
+              echo ""
+              echo "$REFUSAL_MESSAGE"
+              if [ -n "${BRANCH_UPDATE_STATUS:-}" ]; then
+                echo ""
+                echo "**Branch update**: \`${BRANCH_UPDATE_STATUS:-}\`"
+                if [ -n "${BRANCH_UPDATE_MESSAGE:-}" ]; then
+                  echo "${BRANCH_UPDATE_MESSAGE:-}"
+                fi
+              fi
+              exit 0
+            fi
             echo "**Stacks applied** (in order):"
             echo "$APPLIED_JSON" | jq -r '.[] | "- ✅ \(.)"'
             if [ -n "$FAILED_STACK" ]; then
@@ -528,7 +608,7 @@ jobs:
 
       - name: Enrich with LLM
         id: llm
-        if: ${{ always() }}
+        if: ${{ always() && steps.summarize.outputs.outcome != 'action_required' }}
         uses: infinity-constellation/ci-workflows/.github/actions/llm-comment@main
         with:
           event-type: ${{ steps.summarize.outputs.outcome == 'success' && 'apply-success' || 'apply-failure' }}
@@ -550,6 +630,10 @@ jobs:
           OUTCOME: ${{ steps.summarize.outputs.outcome }}
           APPLIED_JSON: ${{ steps.summarize.outputs.applied_stacks }}
           FAILED_STACK: ${{ steps.summarize.outputs.failed_stack }}
+          REFUSAL_REASON: ${{ steps.summarize.outputs.refusal_reason }}
+          REFUSAL_MESSAGE: ${{ steps.summarize.outputs.refusal_message }}
+          BRANCH_UPDATE_STATUS: ${{ steps.summarize.outputs.branch_update_status }}
+          BRANCH_UPDATE_MESSAGE: ${{ steps.summarize.outputs.branch_update_message }}
           STACKS_JSON: ${{ inputs.stacks }}
           PR_NUMBER: ${{ inputs.pr-number }}
           APPROVER_LOGIN: ${{ inputs.approver-login }}
@@ -591,12 +675,32 @@ jobs:
 
             const lines = [marker];
 
-            if (outcome === 'success') {
+            if (outcome === 'action_required') {
+              const reason = process.env.REFUSAL_REASON || 'pre_apply_refusal';
+              const message = process.env.REFUSAL_MESSAGE || 'The agent refused to apply this saved plan before touching infrastructure.';
+              const updateStatus = process.env.BRANCH_UPDATE_STATUS || '';
+              const updateMessage = process.env.BRANCH_UPDATE_MESSAGE || '';
+
+              lines.push('#### Apply paused — fresh plan required');
+              lines.push('');
+              lines.push(`Approved by @${approver} · [run](${runUrl})`);
+              lines.push('');
+              lines.push(message);
+              lines.push('');
+              lines.push('**No infrastructure changes were applied.**');
+              lines.push('');
+              lines.push(`**Reason:** \`${reason}\``);
+              if (updateStatus) {
+                lines.push('', `**Branch update:** \`${updateStatus}\``);
+                if (updateMessage) { lines.push(updateMessage); }
+              }
+              lines.push('', 'A fresh plan must run on the updated branch and receive approval before apply can continue.');
+            } else if (outcome === 'success') {
               lines.push(`#### Applied — ${primaryDisplay}`);
               lines.push('');
               lines.push(`Approved by @${approver} · [run](${runUrl})`);
               lines.push('');
-                lines.push(applied.map(s => `- ✅ \`${toDisplayId(s)}\``).join('\n'));
+              lines.push(applied.map(s => `- ✅ \`${toDisplayId(s)}\``).join('\n'));
               if (llmSummary) { lines.push('', llmSummary); }
               if (llmDetails) { lines.push('', llmDetails); }
               if (llmCta)     { lines.push('', `> ${llmCta}`); }
@@ -609,7 +713,7 @@ jobs:
               lines.push('');
               if (applied.length > 0) {
                 lines.push('**Applied before failure:**');
-              lines.push(applied.map(s => `- ✅ \`${toDisplayId(s)}\``).join('\n'));
+                lines.push(applied.map(s => `- ✅ \`${toDisplayId(s)}\``).join('\n'));
                 lines.push('');
               }
               lines.push(`**Failed:** \`${toDisplayId(failed)}\``);
@@ -842,10 +946,10 @@ jobs:
           name: gravity-devops-agent / apply
           head-sha: ${{ inputs.head-sha }}
           status: completed
-          conclusion: ${{ steps.summarize.outputs.outcome == 'success' && 'success' || 'failure' }}
+          conclusion: ${{ steps.summarize.outputs.outcome == 'success' && 'success' || (steps.summarize.outputs.outcome == 'action_required' && 'action_required' || 'failure') }}
           check-run-id: ${{ steps.check-run-start.outputs.check-run-id }}
-          title: ${{ steps.summarize.outputs.outcome == 'success' && 'Applied' || 'Apply failed' }}
-          summary: ${{ steps.summarize.outputs.outcome == 'success' && 'All stacks applied successfully.' || 'Apply failed — see postmortem comment.' }}
+          title: ${{ steps.summarize.outputs.outcome == 'success' && 'Applied' || (steps.summarize.outputs.outcome == 'action_required' && 'Apply paused' || 'Apply failed') }}
+          summary: ${{ steps.summarize.outputs.outcome == 'success' && 'All stacks applied successfully.' || (steps.summarize.outputs.outcome == 'action_required' && 'No infrastructure changes were applied. A fresh plan is required.' || 'Apply failed — see postmortem comment.') }}
 
       - name: Dispatch postmortem on failure
         if: ${{ steps.summarize.outputs.outcome == 'failure' }}
