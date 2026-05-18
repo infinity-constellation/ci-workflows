@@ -15,6 +15,16 @@ on:
         description: "staging or production"
         required: true
         type: string
+      target-label:
+        description: "Display label for the release target. Defaults to Production/Staging based on environment."
+        required: false
+        type: string
+        default: ""
+      footer-text:
+        description: "Footer/context text. Defaults to Docker/ECR deployment wording for service releases."
+        required: false
+        type: string
+        default: "Image pushed to ECR · Flux deploy pending"
       release_notes:
         description: "Release notes markdown from semantic-release (new_release_notes output)"
         required: false
@@ -38,6 +48,8 @@ jobs:
           SERVICE: ${{ inputs.service }}
           VERSION: v${{ inputs.version }}
           ENVIRONMENT: ${{ inputs.environment }}
+          TARGET_LABEL: ${{ inputs.target-label }}
+          FOOTER_TEXT: ${{ inputs.footer-text }}
           COMMIT_SHA: ${{ github.sha }}
           REPO: ${{ github.repository }}
           SERVER_URL: ${{ github.server_url }}
@@ -51,6 +63,8 @@ jobs:
           service      = os.environ["SERVICE"]
           version      = os.environ["VERSION"]
           env          = os.environ["ENVIRONMENT"]
+          target_label = os.environ.get("TARGET_LABEL") or ""
+          footer_text  = os.environ.get("FOOTER_TEXT") or "Image pushed to ECR · Flux deploy pending"
           sha          = os.environ["COMMIT_SHA"]
           sha_short    = sha[:7]
           repo         = os.environ["REPO"]
@@ -64,7 +78,7 @@ jobs:
 
           is_prod      = env == "production"
           emoji        = ":rocket:" if is_prod else ":package:"
-          env_label    = "Production" if is_prod else "Staging"
+          env_label    = target_label or ("Production" if is_prod else "Staging")
 
           # --- Parse release notes markdown → Slack mrkdwn ---
           raw_notes = open("/tmp/release_notes.md").read().strip()
@@ -130,7 +144,7 @@ jobs:
                       "type": "mrkdwn",
                       "text": (
                           f"<{run_url}|Actions run> · "
-                          f"Image pushed to ECR · Flux deploy pending"
+                          f"{footer_text}"
                       ),
                   }
               ],
