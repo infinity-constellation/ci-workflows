@@ -32,18 +32,33 @@ on:
         default: ""
     secrets:
       SLACK_WEBHOOK_URL:
-        required: true
+        description: "Slack incoming-webhook URL. When unset or empty, the notify job no-ops with a clear summary instead of failing."
+        required: false
 
 jobs:
   notify:
     runs-on: ubuntu-latest
     steps:
+      - name: Check webhook configuration
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          if [ -z "$SLACK_WEBHOOK_URL" ]; then
+            echo "### Slack notification skipped" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "\`SLACK_WEBHOOK_URL\` secret is unset on this repo." >> "$GITHUB_STEP_SUMMARY"
+            echo "Add it via \`gh secret set SLACK_WEBHOOK_URL --repo <org/repo>\` to enable release notifications." >> "$GITHUB_STEP_SUMMARY"
+            echo "SKIP_NOTIFY=true" >> "$GITHUB_ENV"
+          fi
+
       - name: Write release notes to file
+        if: env.SKIP_NOTIFY != 'true'
         env:
           RELEASE_NOTES: ${{ inputs.release_notes }}
         run: printf '%s' "$RELEASE_NOTES" > /tmp/release_notes.md
 
       - name: Build and post Slack message
+        if: env.SKIP_NOTIFY != 'true'
         env:
           SERVICE: ${{ inputs.service }}
           VERSION: v${{ inputs.version }}
