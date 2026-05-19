@@ -57,11 +57,6 @@ on:
         required: false
         type: string
         default: ""
-      latest-on-main:
-        description: "Tag latest when github.ref_name == main."
-        required: false
-        type: boolean
-        default: false
       runs-on:
         description: "Runner label"
         required: false
@@ -169,7 +164,6 @@ jobs:
           IMAGE: ${{ steps.resolve.outputs.image }}
           VERSION: ${{ inputs.version }}
           EXTRA_TAGS: ${{ inputs.extra-tags }}
-          LATEST_ON_MAIN: ${{ inputs.latest-on-main }}
           PUSH: ${{ inputs.push }}
         run: |
           set -euo pipefail
@@ -180,13 +174,17 @@ jobs:
             TAGS="$SHA_TAG"
           fi
 
-          if [ "$LATEST_ON_MAIN" = "true" ] && [ "${GITHUB_REF_NAME}" = "main" ]; then
-            TAGS="${TAGS},${IMAGE}:latest"
-          fi
+          # ECR is configured with IMMUTABLE tags org-wide — we never push :latest.
+          # Flux consumes exact semver tags via ImagePolicy; :latest would fail on
+          # re-deploy because immutable registries reject overwrites.
           if [ -n "$EXTRA_TAGS" ]; then
             IFS=',' read -ra EXTRA <<< "$EXTRA_TAGS"
             for tag in "${EXTRA[@]}"; do
               [ -z "$tag" ] && continue
+              if [ "$tag" = "latest" ]; then
+                echo "::error::extra-tags must not include 'latest' — ECR is immutable and Flux consumes semver tags only."
+                exit 1
+              fi
               TAGS="${TAGS},${IMAGE}:${tag}"
             done
           fi
